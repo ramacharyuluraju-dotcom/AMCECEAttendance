@@ -10,6 +10,7 @@ from datetime import datetime
 st.set_page_config(page_title="Student Attendance", layout="centered", page_icon="📝")
 
 # --- FIREBASE CONNECTION ---
+# This connects to the database using the secret key stored in Streamlit Cloud
 if not firebase_admin._apps:
     try:
         if "textkey" in st.secrets:
@@ -28,7 +29,7 @@ if not firebase_admin._apps:
             cred = credentials.Certificate(key_dict)
             firebase_admin.initialize_app(cred)
         else:
-            st.warning("⚠️ Firebase credentials not found in Secrets.")
+            st.warning("⚠️ Firebase credentials not found in Secrets. Please configure Streamlit Secrets.")
             st.stop()
     except Exception as e:
         st.error(f"Failed to connect to Firebase: {e}")
@@ -54,6 +55,7 @@ def upload_to_firestore(collection_name, df):
         batch_count += 1
         total_uploaded += 1
         
+        # Firestore batch limit is 500 operations
         if batch_count >= 400:
             batch.commit()
             batch = db.batch()
@@ -201,13 +203,20 @@ def main():
                     df_stu = pd.read_csv(up_stu)
                     df_stu.columns = df_stu.columns.str.strip()
                     
-                    # Fix missing Section column logic
+                    # Fix missing Section column logic (Specific fix for your Sheet 3)
                     if 'Section' not in df_stu.columns:
                         cols = list(df_stu.columns)
+                        # Your sheet usually has [Sl. No, USN, Name, Section]
+                        # So Section is likely the 4th column (index 3)
+                        # We try to find 'Name' and grab the next one
                         if 'Name' in cols:
                             idx = cols.index('Name')
                             if len(cols) > idx + 1:
                                 df_stu.rename(columns={cols[idx+1]: 'Section'}, inplace=True)
+                        # Fallback: if headers are weird, grab the 4th column by index
+                        elif len(cols) >= 4:
+                             df_stu.rename(columns={cols[3]: 'Section'}, inplace=True)
+
                     
                     with st.spinner("Uploading to Cloud..."):
                         c1 = upload_to_firestore('setup_subjects', df_sub)
