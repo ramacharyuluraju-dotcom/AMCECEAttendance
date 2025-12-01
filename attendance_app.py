@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Student Attendance", layout="centered", page_icon="📝")
+st.set_page_config(page_title="Attendance App v2.1", layout="centered", page_icon="📝")
 
 # --- FIREBASE CONNECTION ---
 if not firebase_admin._apps:
@@ -108,7 +108,7 @@ def save_attendance_record(records):
 # --- MAIN APP ---
 
 def main():
-    st.title("☁️ Class Attendance App")
+    st.title("☁️ Attendance App (v2.1)")
 
     # 1. Load Data
     with st.spinner("Syncing..."):
@@ -191,7 +191,7 @@ def main():
                                         "Timestamp": timestamp
                                     })
                                 save_attendance_record(records)
-                            st.success("Attendance Saved!")
+                            st.success("Attendance Saved! (Duplicates prevented)")
                     else:
                         st.error(f"No students found for Section {current_section}")
         else:
