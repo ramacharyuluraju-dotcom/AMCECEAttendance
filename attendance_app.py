@@ -10,18 +10,15 @@ from datetime import datetime
 st.set_page_config(page_title="Student Attendance", layout="centered", page_icon="📝")
 
 # --- FIREBASE CONNECTION ---
-# This connects to the database using the secret key stored in Streamlit Cloud
 if not firebase_admin._apps:
     try:
         if "textkey" in st.secrets:
-            # Parse the secret key (it might be a string or a dict depending on how it was pasted)
             secret_val = st.secrets["textkey"]
             if isinstance(secret_val, str):
                 try:
                     key_dict = json.loads(secret_val)
                 except json.JSONDecodeError:
-                     # Fallback: maybe it was pasted as TOML directly?
-                     st.error("Error decoding JSON key. Please check the format in Secrets.")
+                     st.error("Error decoding JSON key.")
                      st.stop()
             else:
                 key_dict = secret_val
@@ -29,7 +26,7 @@ if not firebase_admin._apps:
             cred = credentials.Certificate(key_dict)
             firebase_admin.initialize_app(cred)
         else:
-            st.warning("⚠️ Firebase credentials not found in Secrets. Please configure Streamlit Secrets.")
+            st.warning("⚠️ Firebase credentials not found.")
             st.stop()
     except Exception as e:
         st.error(f"Failed to connect to Firebase: {e}")
@@ -39,8 +36,20 @@ db = firestore.client()
 
 # --- DATABASE FUNCTIONS ---
 
+def delete_collection(coll_ref, batch_size):
+    """Deletes all documents in a collection."""
+    docs = coll_ref.limit(batch_size).stream()
+    deleted = 0
+
+    for doc in docs:
+        doc.reference.delete()
+        deleted += 1
+
+    if deleted >= batch_size:
+        return delete_collection(coll_ref, batch_size)
+
 def upload_to_firestore(collection_name, df):
-    """Uploads a dataframe to a Firestore collection using batch writes."""
+    """Uploads a dataframe to a Firestore collection."""
     records = df.to_dict(orient='records')
     batch = db.batch()
     batch_count = 0
@@ -49,13 +58,11 @@ def upload_to_firestore(collection_name, df):
     coll_ref = db.collection(collection_name)
     
     for i, record in enumerate(records):
-        # Use index as ID to allow easy overwrites
         doc_ref = coll_ref.document(str(i))
         batch.set(doc_ref, record)
         batch_count += 1
         total_uploaded += 1
         
-        # Firestore batch limit is 500 operations
         if batch_count >= 400:
             batch.commit()
             batch = db.batch()
@@ -68,7 +75,6 @@ def upload_to_firestore(collection_name, df):
 
 @st.cache_data(ttl=600)
 def fetch_collection_as_df(collection_name):
-    """Fetches a collection and returns a DataFrame."""
     docs = db.collection(collection_name).stream()
     data = [doc.to_dict() for doc in docs]
     if not data:
@@ -76,12 +82,27 @@ def fetch_collection_as_df(collection_name):
     return pd.DataFrame(data)
 
 def save_attendance_record(records):
-    """Saves attendance records."""
+    """
+    Saves attendance records with DUPLICATE PREVENTION.
+    It creates a unique ID for each student's entry based on:
+    Date_Section_Subject_Time_USN
+    """
     batch = db.batch()
     collection_ref = db.collection('attendance_records')
+    
     for record in records:
-        doc_ref = collection_ref.document()
+        # 1. Create a Unique ID string
+        # Example ID: "2023-11-01_3A_BEC302_09:00-10:00_1AM24EC001"
+        unique_id = f"{record['Date']}_{record['Section']}_{record['Code']}_{record['Time']}_{record['USN']}"
+        
+        # 2. Clean the ID (remove spaces or problematic chars)
+        unique_id = unique_id.replace(" ", "").replace("/", "-")
+        
+        # 3. Use this ID to set the document
+        # If it exists, it Overwrites. If not, it Creates.
+        doc_ref = collection_ref.document(unique_id)
         batch.set(doc_ref, record)
+        
     batch.commit()
 
 # --- MAIN APP ---
@@ -185,16 +206,29 @@ def main():
                 st.dataframe(hist, use_container_width=True)
                 csv = hist.to_csv(index=False).encode('utf-8')
                 st.download_button("📥 Download CSV", csv, "attendance.csv", "text/csv")
+            else:
+                st.info("No records found.")
 
     # --- SETUP ---
     with tab1 if not system_ready else tab3:
         st.header("⚙️ System Initialization")
+        
+        # RESET SECTION
+        with st.expander("⚠️ Danger Zone: Reset System"):
+            st.warning("Only use this when starting a NEW SEMESTER. It will delete all student/subject data.")
+            if st.button("🗑️ Wipe All Master Data"):
+                with st.spinner("Deleting old data..."):
+                    delete_collection(db.collection('setup_subjects'), 50)
+                    delete_collection(db.collection('setup_students'), 50)
+                st.success("System Wiped. Ready for new files.")
+                st.rerun()
+
         st.info("Upload Sheet 1 (Subjects) and Sheet 3 (Students) here.")
         
         up_sub = st.file_uploader("Upload Sheet 1", type=['csv'])
         up_stu = st.file_uploader("Upload Sheet 3", type=['csv'])
         
-        if st.button("🚀 Initialize", type="primary"):
+        if st.button("🚀 Initialize / Update", type="primary"):
             if up_sub and up_stu:
                 try:
                     df_sub = pd.read_csv(up_sub)
@@ -203,21 +237,15 @@ def main():
                     df_stu = pd.read_csv(up_stu)
                     df_stu.columns = df_stu.columns.str.strip()
                     
-                    # Fix missing Section column logic (Specific fix for your Sheet 3)
                     if 'Section' not in df_stu.columns:
                         cols = list(df_stu.columns)
-                        # Your sheet usually has [Sl. No, USN, Name, Section]
-                        # So Section is likely the 4th column (index 3)
-                        # We try to find 'Name' and grab the next one
                         if 'Name' in cols:
                             idx = cols.index('Name')
                             if len(cols) > idx + 1:
                                 df_stu.rename(columns={cols[idx+1]: 'Section'}, inplace=True)
-                        # Fallback: if headers are weird, grab the 4th column by index
                         elif len(cols) >= 4:
                              df_stu.rename(columns={cols[3]: 'Section'}, inplace=True)
 
-                    
                     with st.spinner("Uploading to Cloud..."):
                         c1 = upload_to_firestore('setup_subjects', df_sub)
                         c2 = upload_to_firestore('setup_students', df_stu)
