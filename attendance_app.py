@@ -73,7 +73,7 @@ def upload_to_firestore(collection_name, df):
         
     return total_uploaded
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=86400)  # 86400 seconds = 24 Hours
 def fetch_collection_as_df(collection_name):
     docs = db.collection(collection_name).stream()
     data = [doc.to_dict() for doc in docs]
