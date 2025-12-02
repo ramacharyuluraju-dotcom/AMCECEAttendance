@@ -297,33 +297,50 @@ def render_faculty_dashboard():
     # === IA PATTERN ===
     with tabs[2]:
         st.markdown("**Configure Assessment Pattern**")
-        st.info("Define which Question maps to which CO.")
+        st.info("Define the Question Paper structure (Max Marks & CO Mapping). Use 'Add Row' to add more sub-questions.")
         
         exam_type_cfg = st.selectbox("Select Exam to Configure", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="cfg_exam")
         
-        # Grid for Pattern
-        # Rows: Q1, Q2, Q3, Q4. Cols: Max Marks, Mapped CO
-        pattern_data = {
-            "Question": ["Q1", "Q2", "Q3", "Q4"],
-            "Max Marks": [10, 10, 10, 10],
-            "Mapped CO": ["CO1", "CO2", "CO1", "CO2"]
-        }
-        df_pattern = pd.DataFrame(pattern_data)
+        # Pre-fill with standard sub-questions based on user request (1a, 1b...)
+        # Users can add/remove rows dynamically in the editor
+        if 'pattern_data' not in st.session_state:
+             st.session_state.pattern_data = {
+                "Question": ["1a", "1b", "1c", "2a", "2b", "2c", "3a", "3b", "3c", "4a", "4b", "4c"],
+                "Max Marks": [5, 5, 0, 5, 5, 0, 5, 5, 0, 5, 5, 0],
+                "Mapped CO": ["CO1", "CO1", "CO1", "CO2", "CO2", "CO2", "CO3", "CO3", "CO3", "CO4", "CO4", "CO4"]
+            }
+        
+        # Check if we already have a saved pattern to load instead of default
+        saved_pat = fetch_assessment_pattern(current_sub_code, exam_type_cfg)
+        if saved_pat:
+            # Convert saved dict back to list format for editor
+            # Saved: {'1a': {'max': 5, 'co': 'CO1'}, ...}
+            qs = sorted(list(saved_pat.keys()))
+            df_pattern = pd.DataFrame({
+                "Question": qs,
+                "Max Marks": [saved_pat[q]['max'] for q in qs],
+                "Mapped CO": [saved_pat[q]['co'] for q in qs]
+            })
+        else:
+             df_pattern = pd.DataFrame(st.session_state.pattern_data)
         
         edited_pattern = st.data_editor(
             df_pattern,
             column_config={
-                "Mapped CO": st.column_config.SelectboxColumn(options=[f"CO{i}" for i in range(1,7)])
+                "Mapped CO": st.column_config.SelectboxColumn(options=[f"CO{i}" for i in range(1,7)]),
+                "Max Marks": st.column_config.NumberColumn(min_value=0, max_value=20)
             },
             hide_index=True,
-            use_container_width=True
+            use_container_width=True,
+            num_rows="dynamic" # Allows adding/deleting rows (e.g. adding 5a)
         )
         
         if st.button("💾 Save Pattern"):
-            # Convert DF to Dict {Q1: {max: 10, co: CO1}}
+            # Convert DF to Dict {1a: {max: 5, co: CO1}}
             pat_dict = {}
             for _, row in edited_pattern.iterrows():
-                pat_dict[row['Question']] = {"max": row['Max Marks'], "co": row['Mapped CO']}
+                if row['Question'] and str(row['Question']).strip() != "":
+                    pat_dict[str(row['Question']).strip()] = {"max": row['Max Marks'], "co": row['Mapped CO']}
             
             save_assessment_pattern(current_sub_code, exam_type_cfg, pat_dict)
             st.success(f"Pattern for {exam_type_cfg} Saved!")
@@ -342,8 +359,10 @@ def render_faculty_dashboard():
             sec_stu = df_students[df_students['Section'] == current_section].copy()
             
             if not sec_stu.empty:
-                # Prepare Columns based on Pattern Keys (Q1, Q2...)
+                # Prepare Columns based on Pattern Keys (1a, 1b...)
+                # Natural sort attempt or just alpha sort
                 q_cols = sorted(list(pat.keys()))
+                
                 marks_df = sec_stu[['USN', 'Name']].copy()
                 for q in q_cols:
                     marks_df[q] = 0
