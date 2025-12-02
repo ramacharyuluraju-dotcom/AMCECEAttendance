@@ -84,10 +84,9 @@ def save_attendance_record(records):
         batch.set(doc_ref, record)
     batch.commit()
 
-# --- NEW: IA & CO-PO FUNCTIONS ---
+# --- NEW: IA, PATTERN & REPORT FUNCTIONS ---
 
 def save_copo_mapping(subject_code, mapping_data):
-    """Saves the CO-PO matrix for a subject."""
     doc_ref = db.collection('co_po_mappings').document(subject_code)
     doc_ref.set({
         "subject_code": subject_code,
@@ -101,45 +100,149 @@ def fetch_copo_mapping(subject_code):
         return doc.to_dict()['mapping']
     return None
 
+def save_assessment_pattern(subject_code, exam_type, pattern_data):
+    """Saves Q1->CO1 mapping."""
+    uid = f"{subject_code}_{exam_type}"
+    db.collection('assessment_patterns').document(uid).set({
+        "subject_code": subject_code,
+        "exam_type": exam_type,
+        "pattern": pattern_data
+    })
+
+def fetch_assessment_pattern(subject_code, exam_type):
+    uid = f"{subject_code}_{exam_type}"
+    doc = db.collection('assessment_patterns').document(uid).get()
+    if doc.exists:
+        return doc.to_dict()['pattern']
+    return None
+
 def save_ia_marks(records, exam_type, subject_code):
-    """Saves marks. ID structure: Exam_Subject_USN"""
     batch = db.batch()
     coll = db.collection('ia_marks')
     for rec in records:
-        # ID: IA1_BEC302_1AM24EC001
         uid = f"{exam_type}_{subject_code}_{rec['USN']}"
         uid = uid.replace(" ", "")
         batch.set(coll.document(uid), rec)
     batch.commit()
+
+def calculate_attainment(subject_code):
+    """
+    THE CORE ENGINE: Calculates CO and PO attainment.
+    """
+    # 1. Fetch IA Marks
+    marks_ref = db.collection('ia_marks').where('Code', '==', subject_code).stream()
+    marks_data = [d.to_dict() for d in marks_ref]
+    if not marks_data:
+        return None, "No marks found."
+    
+    # 2. Fetch Patterns (to know Max Marks & CO mapping)
+    patterns_ref = db.collection('assessment_patterns').where('subject_code', '==', subject_code).stream()
+    patterns = {d.to_dict()['exam_type']: d.to_dict()['pattern'] for d in patterns_ref}
+    
+    if not patterns:
+        return None, "No assessment pattern defined. Please configure IA Pattern."
+
+    # 3. Aggregation Containers
+    co_totals = {f"CO{i}": 0 for i in range(1, 7)}
+    co_max_totals = {f"CO{i}": 0 for i in range(1, 7)}
+    student_co_scores = {} # {USN: {CO1: obtained, CO1_max: max}}
+
+    # 4. Process Every Student Record
+    for record in marks_data:
+        exam = record['Exam']
+        usn = record['USN']
+        scores = record['Scores'] # {Q1: 5, Q2: 8...}
+        
+        if exam not in patterns: continue
+        pattern = patterns[exam] # {Q1: {co: CO1, max: 10}...}
+        
+        if usn not in student_co_scores:
+            student_co_scores[usn] = {f"CO{i}": 0 for i in range(1, 7)}
+            student_co_scores[usn].update({f"CO{i}_max": 0 for i in range(1, 7)})
+            
+        for q_key, obtained_mark in scores.items():
+            if q_key in pattern:
+                target_co = pattern[q_key]['co']
+                max_mark = pattern[q_key]['max']
+                
+                # Add to Student Total
+                student_co_scores[usn][target_co] += obtained_mark
+                student_co_scores[usn][f"{target_co}_max"] += max_mark
+
+    # 5. Calculate Attainment Level (Threshold: 60% of students scoring > 60%)
+    # Simplified Logic: Average % of class for this demo
+    co_attainment_results = {}
+    
+    for co in [f"CO{i}" for i in range(1, 7)]:
+        total_students = len(student_co_scores)
+        if total_students == 0: continue
+        
+        students_passed_threshold = 0
+        
+        for usn, data in student_co_scores.items():
+            if data[f"{co}_max"] > 0:
+                percentage = (data[co] / data[f"{co}_max"]) * 100
+                if percentage >= 60: # Threshold
+                    students_passed_threshold += 1
+        
+        attainment_percentage = (students_passed_threshold / total_students) * 100
+        
+        # Determine Level (1, 2, 3)
+        level = 0
+        if attainment_percentage >= 70: level = 3
+        elif attainment_percentage >= 60: level = 2
+        elif attainment_percentage >= 50: level = 1
+        
+        co_attainment_results[co] = level
+
+    # 6. Map to POs
+    copo_matrix = fetch_copo_mapping(subject_code)
+    po_results = {}
+    
+    if copo_matrix:
+        # copo_matrix is {PO1: [3, 2, 1...], PO2: ...} where index 0 is CO1
+        for po_key, values in copo_matrix.items():
+            if po_key == "CO_ID": continue # Skip ID column
+            
+            weighted_sum = 0
+            count = 0
+            
+            for i, val in enumerate(values):
+                co_key = f"CO{i+1}"
+                if val and val > 0 and co_key in co_attainment_results:
+                    weighted_sum += (val * co_attainment_results[co_key])
+                    count += val
+            
+            if count > 0:
+                po_results[po_key] = round(weighted_sum / count, 2)
+            else:
+                po_results[po_key] = 0
+
+    return {"CO": co_attainment_results, "PO": po_results}, "Success"
 
 # --- MODULES ---
 
 def render_faculty_dashboard():
     st.subheader("👨‍🏫 Faculty Dashboard")
     
-    # 1. GLOBAL FILTERS (Select once, use everywhere)
+    # 1. GLOBAL FILTERS
     with st.spinner("Loading Data..."):
         df_subjects = fetch_collection_as_df('setup_subjects')
         df_students = fetch_collection_as_df('setup_students')
     
     if df_subjects.empty:
-        st.warning("No subjects found. Please go to System Admin.")
+        st.warning("No subjects found.")
         return
 
-    # A. Select Faculty
     faculty_list = sorted(df_subjects['Faculty Name'].unique().tolist())
     selected_faculty = st.selectbox("Select Faculty Name", faculty_list)
     
-    # B. Select Subject
     faculty_data = df_subjects[df_subjects['Faculty Name'] == selected_faculty]
-    if faculty_data.empty:
-        st.info("No subjects assigned.")
-        return
+    if faculty_data.empty: return
 
     faculty_data['Display_Label'] = faculty_data['Section'].astype(str) + " - " + faculty_data['Subject Name']
     selected_label = st.selectbox("Select Active Class", faculty_data['Display_Label'].unique())
     
-    # Extract Context
     class_info = faculty_data[faculty_data['Display_Label'] == selected_label].iloc[0]
     current_section = str(class_info['Section']).strip()
     current_sub_name = class_info['Subject Name']
@@ -148,14 +251,14 @@ def render_faculty_dashboard():
     st.markdown("---")
     
     # 2. TASK TABS
-    task_tab = st.radio("Select Task", ["📝 Attendance", "📊 CO-PO Mapping", "💯 Internal Assessment (IA)"], horizontal=True)
+    tabs = st.tabs(["📝 Attendance", "⚙️ IA Pattern", "💯 IA Entry", "📊 CO-PO Mapping", "📈 Reports"])
 
-    # === TASK 1: ATTENDANCE ===
-    if task_tab == "📝 Attendance":
-        st.markdown(f"**Marking Attendance for: {current_sub_name} ({current_section})**")
+    # === ATTENDANCE ===
+    with tabs[0]:
+        st.markdown(f"**Attendance: {current_sub_name}**")
         col1, col2 = st.columns(2)
         with col1: date_val = st.date_input("Date", datetime.now())
-        with col2: time_slot = st.selectbox("Time", ["09:00-10:00", "10:00-11:00", "11:15-12:15", "12:15-01:15", "02:00-03:00", "03:00-04:00"])
+        with col2: time_slot = st.selectbox("Time", ["09:00-10:00", "10:00-11:00", "11:15-12:15", "12:15-01:15", "02:00-03:00"])
         
         df_students['Section'] = df_students['Section'].astype(str).str.strip()
         section_students = df_students[df_students['Section'] == current_section].copy()
@@ -163,171 +266,149 @@ def render_faculty_dashboard():
         if not section_students.empty:
             att_df = section_students[['USN', 'Name']].copy()
             att_df['Present'] = True
-            
-            edited_df = st.data_editor(att_df, column_config={"Present": st.column_config.CheckboxColumn(default=True)}, hide_index=True, use_container_width=True)
-            
-            if st.button("Submit Attendance", type="primary"):
-                records = []
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                for _, row in edited_df.iterrows():
-                    records.append({
-                        "Date": str(date_val), "Time": time_slot, "Faculty": selected_faculty,
-                        "Section": current_section, "Subject": current_sub_name, "Code": current_sub_code,
-                        "USN": row['USN'], "Name": row['Name'], "Status": "Present" if row['Present'] else "Absent", "Timestamp": ts
-                    })
+            edited_df = st.data_editor(att_df, column_config={"Present": st.column_config.CheckboxColumn(default=True)}, hide_index=True)
+            if st.button("Submit Attendance"):
+                records = [{"Date": str(date_val), "Time": time_slot, "Faculty": selected_faculty, "Section": current_section, "Code": current_sub_code, "USN": r['USN'], "Status": "Present" if r['Present'] else "Absent"} for _, r in edited_df.iterrows()]
                 save_attendance_record(records)
-                st.success("Attendance Saved!")
-        else:
-            st.error(f"No students in Section {current_section}")
+                st.success("Saved!")
 
-    # === TASK 2: CO-PO MAPPING ===
-    elif task_tab == "📊 CO-PO Mapping":
-        st.markdown(f"**Course Articulation Matrix for {current_sub_code}**")
-        st.info("Map your Course Outcomes (COs) to Program Outcomes (POs). Level: 1 (Low), 2 (Medium), 3 (High).")
+    # === IA PATTERN ===
+    with tabs[1]:
+        st.markdown("**Configure Assessment Pattern**")
+        st.info("Define which Question maps to which CO.")
         
-        # Default Matrix Structure
+        exam_type_cfg = st.selectbox("Select Exam to Configure", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="cfg_exam")
+        
+        # Grid for Pattern
+        # Rows: Q1, Q2, Q3, Q4. Cols: Max Marks, Mapped CO
+        pattern_data = {
+            "Question": ["Q1", "Q2", "Q3", "Q4"],
+            "Max Marks": [10, 10, 10, 10],
+            "Mapped CO": ["CO1", "CO2", "CO1", "CO2"]
+        }
+        df_pattern = pd.DataFrame(pattern_data)
+        
+        edited_pattern = st.data_editor(
+            df_pattern,
+            column_config={
+                "Mapped CO": st.column_config.SelectboxColumn(options=[f"CO{i}" for i in range(1,7)])
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        if st.button("💾 Save Pattern"):
+            # Convert DF to Dict {Q1: {max: 10, co: CO1}}
+            pat_dict = {}
+            for _, row in edited_pattern.iterrows():
+                pat_dict[row['Question']] = {"max": row['Max Marks'], "co": row['Mapped CO']}
+            
+            save_assessment_pattern(current_sub_code, exam_type_cfg, pat_dict)
+            st.success(f"Pattern for {exam_type_cfg} Saved!")
+
+    # === IA ENTRY ===
+    with tabs[2]:
+        st.markdown(f"**Enter Marks: {current_sub_code}**")
+        exam_type_entry = st.selectbox("Select Assessment", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="entry_exam")
+        
+        # Check if pattern exists
+        pat = fetch_assessment_pattern(current_sub_code, exam_type_entry)
+        if not pat:
+            st.error("⚠️ Pattern not defined for this exam. Go to 'IA Pattern' tab first!")
+        else:
+            df_students['Section'] = df_students['Section'].astype(str).str.strip()
+            sec_stu = df_students[df_students['Section'] == current_section].copy()
+            
+            if not sec_stu.empty:
+                # Prepare Columns based on Pattern Keys (Q1, Q2...)
+                q_cols = sorted(list(pat.keys()))
+                marks_df = sec_stu[['USN', 'Name']].copy()
+                for q in q_cols:
+                    marks_df[q] = 0
+                
+                edited_marks = st.data_editor(marks_df, disabled=["USN", "Name"], hide_index=True)
+                
+                if st.button("💾 Submit Marks"):
+                    recs = []
+                    for _, row in edited_marks.iterrows():
+                        scores = {q: row[q] for q in q_cols}
+                        total = sum(scores.values())
+                        recs.append({
+                            "USN": row['USN'], "Name": row['Name'], "Exam": exam_type_entry,
+                            "Subject": current_sub_name, "Code": current_sub_code,
+                            "Scores": scores, "Total_Obtained": total, "Timestamp": datetime.now().strftime("%Y-%m-%d")
+                        })
+                    save_ia_marks(recs, exam_type_entry, current_sub_code)
+                    st.success("Marks Uploaded!")
+
+    # === CO-PO MAPPING ===
+    with tabs[3]:
+        st.markdown("**Course Articulation Matrix**")
         cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
         rows = [f"CO{i}" for i in range(1, 7)]
         
-        # Check if exists
-        existing_data = fetch_copo_mapping(current_sub_code)
-        
-        if existing_data:
-            df_copo = pd.DataFrame(existing_data)
+        existing = fetch_copo_mapping(current_sub_code)
+        if existing:
+            df_copo = pd.DataFrame(existing)
         else:
-            # Create Empty DF
             df_copo = pd.DataFrame(0, index=rows, columns=cols)
-            df_copo.insert(0, "CO_ID", rows) # Add ID column for display
+            df_copo.insert(0, "CO_ID", rows)
             
-        # Editor
-        edited_copo = st.data_editor(df_copo, hide_index=True, use_container_width=True)
-        
+        edited_copo = st.data_editor(df_copo, hide_index=True)
         if st.button("💾 Save Mapping"):
-            # Convert to dict for JSON storage
-            data_dict = edited_copo.to_dict(orient='list')
-            save_copo_mapping(current_sub_code, data_dict)
-            st.success("Mapping Saved Successfully!")
+            save_copo_mapping(current_sub_code, edited_copo.to_dict(orient='list'))
+            st.success("Saved!")
 
-    # === TASK 3: INTERNAL ASSESSMENT (IA) ===
-    elif task_tab == "💯 Internal Assessment (IA)":
-        st.markdown(f"**IA Entry for {current_sub_code}**")
-        
-        # Configuration
-        col_exam, col_mode = st.columns(2)
-        with col_exam:
-            exam_type = st.selectbox("Select Assessment", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1", "Assignment 2"])
-        
-        # Setup the Grid based on your Excel format
-        # Faculty enters marks Question-wise (Q1, Q2, Q3) to map to COs later
-        st.caption("Enter marks for each question. Leave 0 if not attempted.")
-        
-        df_students['Section'] = df_students['Section'].astype(str).str.strip()
-        section_students = df_students[df_students['Section'] == current_section].copy()
-        
-        if section_students.empty:
-            st.error("No students found.")
-        else:
-            # Create entry sheet
-            # We assume a standard structure based on your file (Q1a, Q1b... is too wide for mobile, so we group by main Qs first)
-            # You can expand this columns list based on the exact structure you want active
-            entry_cols = ['Q1', 'Q2', 'Q3', 'Q4', 'Total'] 
+    # === REPORTS ===
+    with tabs[4]:
+        st.header("📈 Course Attainment Report")
+        if st.button("Generate Report"):
+            with st.spinner("Calculating..."):
+                results, msg = calculate_attainment(current_sub_code)
             
-            # Prepare DF
-            marks_df = section_students[['USN', 'Name']].copy()
-            for c in entry_cols:
-                marks_df[c] = 0  # Initialize with 0
-            
-            # Show Editor
-            edited_marks = st.data_editor(
-                marks_df, 
-                disabled=["USN", "Name", "Total"], # Total should be auto-calc but streamlit editor doesn't auto-sum yet. We sum in python.
-                hide_index=True, 
-                use_container_width=True
-            )
-            
-            if st.button(f"💾 Submit {exam_type} Marks"):
-                final_records = []
-                for _, row in edited_marks.iterrows():
-                    # Calculate total in backend to be safe
-                    total = row['Q1'] + row['Q2'] + row['Q3'] + row['Q4']
-                    
-                    final_records.append({
-                        "USN": row['USN'],
-                        "Name": row['Name'],
-                        "Exam": exam_type,
-                        "Subject": current_sub_name,
-                        "Code": current_sub_code,
-                        "Scores": {
-                            "Q1": row['Q1'], "Q2": row['Q2'], "Q3": row['Q3'], "Q4": row['Q4']
-                        },
-                        "Total_Obtained": total,
-                        "Timestamp": datetime.now().strftime("%Y-%m-%d")
-                    })
+            if results:
+                st.success("Calculation Complete!")
                 
-                save_ia_marks(final_records, exam_type, current_sub_code)
-                st.success(f"{exam_type} Marks uploaded successfully!")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.subheader("CO Attainment Levels")
+                    st.dataframe(pd.DataFrame(list(results['CO'].items()), columns=['CO', 'Level (0-3)']), hide_index=True)
+                
+                with col_b:
+                    st.subheader("Final PO Attainment")
+                    st.dataframe(pd.DataFrame(list(results['PO'].items()), columns=['PO', 'Attained Value']), hide_index=True)
+                    
+                st.markdown("---")
+                st.caption("*Logic: Level 3 if >70% students score >60%, Level 2 if >60%, Level 1 if >50%. PO = (CO-PO Mapping × CO Level) / 3*")
+            else:
+                st.error(msg)
 
 def render_admin_space():
-    st.subheader("⚙️ System Admin & Setup")
-    
-    with st.expander("⚠️ Danger Zone: Reset Semester Data"):
-        st.warning("Use this to Wipe Data for a New Semester.")
-        if st.button("🗑️ Wipe All Master Data"):
-            with st.spinner("Deleting..."):
-                delete_collection(db.collection('setup_subjects'), 50)
-                delete_collection(db.collection('setup_students'), 50)
-                delete_collection(db.collection('setup_syllabus'), 50)
-            st.success("All System Data Wiped.")
+    st.subheader("⚙️ System Admin")
+    with st.expander("Reset Data"):
+        if st.button("Wipe All Data"):
+            delete_collection(db.collection('setup_subjects'), 50)
+            delete_collection(db.collection('setup_students'), 50)
+            st.success("Wiped.")
             st.rerun()
-
-    st.markdown("### Upload Master Files")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.markdown("**1. Faculty/Subjects**")
-        up_sub = st.file_uploader("Upload Sheet 1", type=['csv'], key="sub")
-    
-    with col2:
-        st.markdown("**2. Student List**")
-        up_stu = st.file_uploader("Upload Sheet 3", type=['csv'], key="stu")
-        
-    if st.button("🚀 Initialize System", type="primary"):
-        try:
-            msg = ""
-            if up_sub:
-                df = pd.read_csv(up_sub)
-                df.columns = df.columns.str.strip()
-                c = upload_to_firestore('setup_subjects', df)
-                msg += f"Subjects: {c}. "
-            if up_stu:
-                df = pd.read_csv(up_stu)
-                df.columns = df.columns.str.strip()
-                if 'Section' not in df.columns:
-                    cols = list(df.columns)
-                    if len(cols) >= 4: df.rename(columns={cols[3]: 'Section'}, inplace=True)
-                c = upload_to_firestore('setup_students', df)
-                msg += f"Students: {c}."
             
-            if msg:
-                st.success(f"Success! {msg}")
-            else:
-                st.warning("Upload a file first.")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-# --- MAIN APP ROUTER ---
+    c1, c2 = st.columns(2)
+    up_sub = c1.file_uploader("Subjects (Sheet 1)")
+    up_stu = c2.file_uploader("Students (Sheet 3)")
+    
+    if st.button("Initialize"):
+        if up_sub: upload_to_firestore('setup_subjects', pd.read_csv(up_sub))
+        if up_stu:
+            df = pd.read_csv(up_stu)
+            if 'Section' not in df.columns: df.rename(columns={df.columns[3]: 'Section'}, inplace=True)
+            upload_to_firestore('setup_students', df)
+        st.success("Done")
 
 def main():
-    st.sidebar.title("📚 Dept. RMS")
-    menu = st.sidebar.radio("Navigate", ["Faculty Dashboard", "Student Space", "System Admin"])
-    st.sidebar.divider()
-    
-    if menu == "Faculty Dashboard":
-        render_faculty_dashboard()
-    elif menu == "System Admin":
-        render_admin_space()
-    elif menu == "Student Space":
-        st.info("Student dashboard under construction.")
+    st.sidebar.title("RMS v4.0")
+    menu = st.sidebar.radio("Menu", ["Faculty Dashboard", "System Admin"])
+    if menu == "Faculty Dashboard": render_faculty_dashboard()
+    elif menu == "System Admin": render_admin_space()
 
 if __name__ == "__main__":
     main()
