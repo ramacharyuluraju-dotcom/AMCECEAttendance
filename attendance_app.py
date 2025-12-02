@@ -83,6 +83,7 @@ def save_attendance_record(records):
         doc_ref = collection_ref.document(unique_id)
         batch.set(doc_ref, record)
     batch.commit()
+    st.cache_data.clear() # Clear cache so history updates immediately
 
 # --- NEW: IA, PATTERN & REPORT FUNCTIONS ---
 
@@ -251,7 +252,7 @@ def render_faculty_dashboard():
     st.markdown("---")
     
     # 2. TASK TABS
-    tabs = st.tabs(["📝 Attendance", "⚙️ IA Pattern", "💯 IA Entry", "📊 CO-PO Mapping", "📈 Reports"])
+    tabs = st.tabs(["📝 Attendance", "📊 History", "⚙️ IA Pattern", "💯 IA Entry", "📊 CO-PO Mapping", "📈 Reports"])
 
     # === ATTENDANCE ===
     with tabs[0]:
@@ -272,8 +273,29 @@ def render_faculty_dashboard():
                 save_attendance_record(records)
                 st.success("Saved!")
 
-    # === IA PATTERN ===
+    # === HISTORY ===
     with tabs[1]:
+        st.markdown(f"**Attendance History: {current_sub_name}**")
+        if st.button("🔄 Refresh History"):
+            all_recs = fetch_collection_as_df('attendance_records')
+            if not all_recs.empty:
+                # Filter by subject
+                if 'Code' in all_recs.columns:
+                    sub_recs = all_recs[all_recs['Code'] == current_sub_code]
+                else:
+                    sub_recs = all_recs # Fallback
+                
+                if not sub_recs.empty:
+                    st.dataframe(sub_recs.sort_values(by=['Date', 'Time'], ascending=False), use_container_width=True, hide_index=True)
+                    csv = sub_recs.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Subject CSV", csv, f"attendance_{current_sub_code}.csv", "text/csv")
+                else:
+                    st.info("No records found for this subject.")
+            else:
+                st.info("Database is empty.")
+
+    # === IA PATTERN ===
+    with tabs[2]:
         st.markdown("**Configure Assessment Pattern**")
         st.info("Define which Question maps to which CO.")
         
@@ -307,7 +329,7 @@ def render_faculty_dashboard():
             st.success(f"Pattern for {exam_type_cfg} Saved!")
 
     # === IA ENTRY ===
-    with tabs[2]:
+    with tabs[3]:
         st.markdown(f"**Enter Marks: {current_sub_code}**")
         exam_type_entry = st.selectbox("Select Assessment", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="entry_exam")
         
@@ -342,7 +364,7 @@ def render_faculty_dashboard():
                     st.success("Marks Uploaded!")
 
     # === CO-PO MAPPING ===
-    with tabs[3]:
+    with tabs[4]:
         st.markdown("**Course Articulation Matrix**")
         cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
         rows = [f"CO{i}" for i in range(1, 7)]
@@ -360,7 +382,7 @@ def render_faculty_dashboard():
             st.success("Saved!")
 
     # === REPORTS ===
-    with tabs[4]:
+    with tabs[5]:
         st.header("📈 Course Attainment Report")
         if st.button("Generate Report"):
             with st.spinner("Calculating..."):
@@ -385,6 +407,17 @@ def render_faculty_dashboard():
 
 def render_admin_space():
     st.subheader("⚙️ System Admin")
+    
+    st.markdown("### 📥 Global Reports")
+    if st.button("Download Full Attendance Database"):
+        df = fetch_collection_as_df('attendance_records')
+        if not df.empty:
+            st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "full_attendance.csv", "text/csv")
+        else:
+            st.warning("No data found in attendance records.")
+            
+    st.divider()
+
     with st.expander("Reset Data"):
         if st.button("Wipe All Data"):
             delete_collection(db.collection('setup_subjects'), 50)
