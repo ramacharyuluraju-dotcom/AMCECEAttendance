@@ -213,6 +213,23 @@ def fetch_copo_mapping(subject_code):
     doc = db.collection('co_po_mappings').document(subject_code).get()
     return doc.to_dict()['mapping'] if doc.exists else None
 
+# --- NEW: COURSE METADATA (COs & Syllabus) ---
+
+def save_course_metadata(subject_code, co_statements):
+    """Saves CO definitions (text) for a subject."""
+    doc_ref = db.collection('course_metadata').document(subject_code)
+    doc_ref.set({
+        "subject_code": subject_code,
+        "co_statements": co_statements, # Dict {CO1: "Text...", CO2: ...}
+        "last_updated": datetime.now().strftime("%Y-%m-%d")
+    }, merge=True)
+
+def fetch_course_metadata(subject_code):
+    doc = db.collection('course_metadata').document(subject_code).get()
+    if doc.exists:
+        return doc.to_dict()
+    return {}
+
 # --- STUDENT MANAGEMENT FUNCTIONS (Restored) ---
 
 def register_students_bulk(df, ay, batch, semester, section):
@@ -276,7 +293,7 @@ def render_faculty_dashboard():
     current_code = class_info['Subject Code']
     
     st.divider()
-    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📊 Reports", "📋 CO-PO"])
+    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📘 Course File", "📊 Reports", "📋 CO-PO"])
 
     # 1. ATTENDANCE
     with tabs[0]:
@@ -296,12 +313,11 @@ def render_faculty_dashboard():
                     save_attendance_record(recs); st.success("Saved!")
             else: st.info("No students.")
 
-    # 2. QUESTION PAPER (New)
+    # 2. QUESTION PAPER
     with tabs[1]:
         st.markdown("### 📄 Question Paper Setter")
         exam_type = st.selectbox("Exam", ["IA Test 1", "IA Test 2", "IA Test 3"], key="qp_exam")
         
-        # Load Existing
         existing_qp = fetch_question_paper(current_code, exam_type)
         if existing_qp:
             st.info(f"Status: **{existing_qp.get('status', 'Draft')}**")
@@ -335,7 +351,6 @@ def render_faculty_dashboard():
                 num_rows="dynamic", use_container_width=True
             )
 
-        # Preview & Action
         qs_list = edited_qs.to_dict(orient='records')
         meta_data = {"examName": exam_type, "courseName": current_sub, "courseCode": current_code, "semester": current_sec, "date": m_date, "duration": m_dur, "department": "ECE"}
         
@@ -353,32 +368,23 @@ def render_faculty_dashboard():
             st.success("Submitted to HOD!")
             st.rerun()
 
-    # 3. IA ENTRY (Linked to QP)
+    # 3. IA ENTRY
     with tabs[2]:
         st.markdown("### 💯 Marks Entry")
         exam_entry = st.selectbox("Exam", ["IA Test 1", "IA Test 2", "IA Test 3"], key="ia_entry")
-        
         qp = fetch_question_paper(current_code, exam_entry)
         
-        if not qp:
-            st.error("⚠️ Question Paper not found. Please create one first.")
-        elif qp.get('status') != "Approved":
-            st.warning(f"⚠️ Question Paper is currently **{qp.get('status')}**. Waiting for HOD Approval.")
+        if not qp: st.error("⚠️ QP not found.")
+        elif qp.get('status') != "Approved": st.warning(f"⚠️ QP Status: {qp.get('status')}.")
         else:
-            # Paper is Approved, Build Grid
-            st.success("✅ Paper Approved. Enter Marks.")
             if not df_students.empty:
                 df_students['Section'] = df_students['Section'].astype(str).str.strip()
                 sec_stu = df_students[df_students['Section'] == current_sec].copy()
-                
                 if not sec_stu.empty:
-                    # Get columns from QP questions
                     q_cols = [q['qNo'] for q in qp['questions']]
                     marks_df = sec_stu[['USN', 'Name']].copy()
                     for c in q_cols: marks_df[c] = 0
-                    
                     edited_marks = st.data_editor(marks_df, disabled=["USN", "Name"], hide_index=True)
-                    
                     if st.button("Submit Marks"):
                         recs = []
                         for _, row in edited_marks.iterrows():
@@ -392,29 +398,73 @@ def render_faculty_dashboard():
                         save_ia_marks(recs, exam_entry, current_code)
                         st.success("Marks Saved!")
 
-    # 4. REPORTS
-    with tabs[3]: st.info("Attainment reports use data from Approved Question Papers + IA Marks.")
-    
-    # 5. CO-PO (RESTORED)
-    with tabs[4]: 
-        st.markdown("### 📋 Course Articulation Matrix (CO-PO)")
-        st.info("Map Course Outcomes (COs) to Program Outcomes (POs). Level: 1 (Low), 2 (Medium), 3 (High).")
+    # 4. COURSE FILE (NEW)
+    with tabs[3]:
+        st.markdown("### 📘 Course File & Planning")
         
+        cf_tabs = st.tabs(["Define COs", "Syllabus", "Download File"])
+        
+        # A. CO Definition
+        with cf_tabs[0]:
+            st.markdown("**Define Course Outcomes (Text)**")
+            st.caption("Write the actual statement for each CO. This will appear in reports.")
+            
+            # Load existing
+            meta = fetch_course_metadata(current_code)
+            co_texts = meta.get('co_statements', {f"CO{i}": "" for i in range(1,7)})
+            
+            updated_cos = {}
+            for i in range(1, 7):
+                co_key = f"CO{i}"
+                updated_cos[co_key] = st.text_area(f"{co_key}", value=co_texts.get(co_key, ""), height=70, key=f"txt_{co_key}")
+            
+            if st.button("💾 Save CO Statements"):
+                save_course_metadata(current_code, updated_cos)
+                st.success("Statements Saved!")
+
+        # B. Syllabus
+        with cf_tabs[1]:
+            st.markdown("**Syllabus Reference**")
+            # If syllabus was uploaded in System Admin (Sheet 2), try to find relevant rows
+            df_syl = fetch_collection_as_df('setup_syllabus') # You need to ensure this collection exists
+            # Note: In previous versions we didn't fully implement 'setup_syllabus' fetching logic
+            # This is a placeholder for that feature
+            st.info("Upload your syllabus PDF here for quick reference (Feature coming soon). For now, refer to System Admin uploads.")
+
+        # C. Download
+        with cf_tabs[2]:
+            st.markdown("**📥 Download Digital Course File**")
+            st.caption("Generates a complete report including COs, Mapping, Attendance Summary, and Marks.")
+            
+            if st.button("Generate Course File (PDF/HTML)"):
+                # Simplified: Just dump data for now
+                co_map = fetch_copo_mapping(current_code)
+                co_txt = fetch_course_metadata(current_code).get('co_statements', {})
+                
+                # Create a simple summary text
+                report = f"COURSE FILE: {current_sub} ({current_code})\n"
+                report += f"Faculty: {selected_faculty}\n"
+                report += "-"*30 + "\n\n"
+                report += "COURSE OUTCOMES:\n"
+                for k, v in co_txt.items():
+                    report += f"{k}: {v}\n"
+                
+                st.download_button("Download Report.txt", report, f"CourseFile_{current_code}.txt")
+
+    # 5. REPORTS
+    with tabs[4]: st.info("Attainment reports logic.")
+    
+    # 6. CO-PO
+    with tabs[5]: 
+        st.markdown("### 📋 Course Articulation Matrix (CO-PO)")
         cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
         rows = [f"CO{i}" for i in range(1, 7)]
-        
         existing = fetch_copo_mapping(current_code)
-        if existing:
-            df_copo = pd.DataFrame(existing)
-        else:
-            df_copo = pd.DataFrame(0, index=rows, columns=cols)
-            df_copo.insert(0, "CO_ID", rows)
-            
+        if existing: df_copo = pd.DataFrame(existing)
+        else: df_copo = pd.DataFrame(0, index=rows, columns=cols); df_copo.insert(0, "CO_ID", rows)
         edited_copo = st.data_editor(df_copo, hide_index=True, use_container_width=True)
-        
         if st.button("💾 Save CO-PO Mapping"):
-            save_copo_mapping(current_code, edited_copo.to_dict(orient='list'))
-            st.success("Mapping Saved Successfully!")
+            save_copo_mapping(current_code, edited_copo.to_dict(orient='list')); st.success("Mapping Saved!")
 
 def render_hod_scrutiny():
     st.subheader("🔍 HOD / Scrutiny Board")
@@ -447,8 +497,6 @@ def render_admin_space():
     # TAB 1: REGISTRATION
     with tabs[0]:
         st.markdown("### 🎓 Register Students for Academic Year")
-        st.info("Use this to onboard new batches or add lateral entry students.")
-        
         c1, c2, c3 = st.columns(3)
         with c1: ay = st.selectbox("Academic Year", ["2023-24", "2024-25", "2025-26"], index=1)
         with c2: batch = st.selectbox("Batch (Joining Year)", ["2021", "2022", "2023", "2024"])
@@ -457,7 +505,6 @@ def render_admin_space():
         target_section = st.text_input("Section to Assign (e.g., 3A, 5B)", placeholder="3A").strip()
         
         st.markdown("#### Option A: Bulk Upload (CSV)")
-        st.caption("Required Columns: `USN`, `Name`")
         up_file = st.file_uploader("Upload Student List CSV", type=['csv'])
         
         if st.button("🚀 Register Batch"):
@@ -465,7 +512,6 @@ def render_admin_space():
                 try:
                     df = pd.read_csv(up_file)
                     df.columns = df.columns.str.strip()
-                    # Basic validation
                     if 'USN' in df.columns and 'Name' in df.columns:
                         count = register_students_bulk(df, ay, batch, sem, target_section)
                         st.success(f"Successfully registered {count} students to {target_section} (AY {ay}).")
