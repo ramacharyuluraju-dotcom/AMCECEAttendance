@@ -416,7 +416,9 @@ def render_faculty_dashboard():
             updated_cos = {}
             for i in range(1, 7):
                 co_key = f"CO{i}"
-                updated_cos[co_key] = st.text_area(f"{co_key}", value=co_texts.get(co_key, ""), height=70, key=f"txt_{co_key}")
+                # FIXED: Added unique key for widget to prevent crashes
+                default_text = co_texts.get(co_key) if co_texts.get(co_key) else ""
+                updated_cos[co_key] = st.text_area(f"{co_key}", value=default_text, height=70, key=f"txt_{current_code}_{co_key}")
             
             if st.button("💾 Save CO Statements"):
                 save_course_metadata(current_code, updated_cos)
