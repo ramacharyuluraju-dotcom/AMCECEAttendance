@@ -10,7 +10,7 @@ from datetime import datetime
 st.set_page_config(page_title="Dept. Record Management System", layout="wide", page_icon="🎓")
 
 # --- FIREBASE CONNECTION (Singleton Pattern) ---
-# Prevents quota exhaustion by reusing the connection
+# This ensures we only connect ONCE per session, saving reads/resources.
 @st.cache_resource
 def get_db():
     if not firebase_admin._apps:
@@ -55,7 +55,7 @@ def generate_qp_html(meta, questions):
         </tr>
         """
 
-    return f"""
+    html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -129,28 +129,19 @@ def generate_qp_html(meta, questions):
     </body>
     </html>
     """
+    return html_content
 
-# --- DATABASE OPERATIONS (Optimized with Caching) ---
+# --- DATABASE OPERATIONS ---
 
-def safe_firestore_write(operation_func, *args, **kwargs):
-    """Wrapper to handle quota errors gracefully."""
-    try:
-        return operation_func(*args, **kwargs)
-    except Exception as e:
-        if "Quota exceeded" in str(e) or "Resource exhausted" in str(e):
-            st.error("⚠️ System Quota Exceeded. Please try again later (Daily limit reached).")
-        else:
-            st.error(f"Database Error: {e}")
-        return None
-
-def delete_collection_batch(coll_ref, batch_size):
+def delete_collection(coll_ref, batch_size):
+    """Deletes all documents in a collection."""
     docs = coll_ref.limit(batch_size).stream()
     deleted = 0
     for doc in docs:
         doc.reference.delete()
         deleted += 1
     if deleted >= batch_size:
-        return delete_collection_batch(coll_ref, batch_size)
+        return delete_collection(coll_ref, batch_size)
 
 def save_question_paper(subject_code, exam_type, meta, questions, status="Draft"):
     uid = f"{subject_code}_{exam_type}"
@@ -166,10 +157,10 @@ def save_question_paper(subject_code, exam_type, meta, questions, status="Draft"
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     db.collection('question_papers').document(uid).set(data)
-    st.cache_data.clear() # Clear cache to reflect changes immediately
+    st.cache_data.clear() # IMPORTANT: Clear cache so HOD sees it immediately
     return True
 
-@st.cache_data(ttl=60) # Cache for 60 seconds to reduce reads
+@st.cache_data(ttl=60) # Cache for 60 seconds to save reads
 def fetch_question_paper(subject_code, exam_type):
     uid = f"{subject_code}_{exam_type}"
     doc = db.collection('question_papers').document(uid).get()
@@ -206,20 +197,16 @@ def upload_to_firestore(collection_name, df):
     st.cache_data.clear()
     return i + 1
 
-@st.cache_data(ttl=300) # Cache heavy lists for 5 minutes
+@st.cache_data(ttl=86400) # Cache for 24 HOURS to drastically reduce reads
 def fetch_collection_as_df(col):
     docs = db.collection(col).stream()
     data = [doc.to_dict() for doc in docs]
     return pd.DataFrame(data) if data else pd.DataFrame()
 
 def save_attendance_record(records):
-    """
-    STRICT DUPLICATE PREVENTION LOGIC
-    It checks using a deterministic ID. If ID exists, it overwrites (updates).
-    """
     batch = db.batch()
     for r in records:
-        # Create a deterministic ID: DATE_SECTION_CODE_TIME_USN
+        # Deterministic ID to prevent duplicates
         uid = f"{r['Date']}_{r['Section']}_{r['Code']}_{r['Time']}_{r['USN']}".replace(" ","").replace("/","-")
         batch.set(db.collection('attendance_records').document(uid), r)
     batch.commit()
@@ -289,7 +276,8 @@ def calculate_attainment(subject_code):
         students_passed = 0
         for usn, data in student_co_scores.items():
             if data[f"{co}_max"] > 0:
-                if (data[co] / data[f"{co}_max"]) * 100 >= 60: students_passed += 1
+                if (data[co] / data[f"{co}_max"]) * 100 >= 60:
+                    students_passed += 1
         
         perc = (students_passed / total_students) * 100
         if perc >= 70: level = 3
@@ -360,11 +348,12 @@ def render_faculty_dashboard():
     
     if df_subjects.empty: st.warning("No subjects."); return
 
+    # Filter only ACTIVE students
     if not df_students_raw.empty and 'Status' in df_students_raw.columns:
         df_students = df_students_raw[df_students_raw['Status'] == 'Active']
-    else: df_students = df_students_raw
+    else:
+        df_students = df_students_raw
 
-    # Selectors
     faculty_list = sorted(df_subjects['Faculty Name'].unique().tolist()) if 'Faculty Name' in df_subjects.columns else []
     selected_faculty = st.selectbox("Faculty", faculty_list)
     faculty_data = df_subjects[df_subjects['Faculty Name'] == selected_faculty]
@@ -373,14 +362,15 @@ def render_faculty_dashboard():
     faculty_data['Display_Label'] = faculty_data['Section'].astype(str) + " - " + faculty_data['Subject Name']
     selected_label = st.selectbox("Class", faculty_data['Display_Label'].unique())
     
-    # Context
     class_info = faculty_data[faculty_data['Display_Label'] == selected_label].iloc[0]
     current_sec = str(class_info['Section']).strip()
     current_sub = class_info['Subject Name']
     current_code = class_info['Subject Code']
     
     st.divider()
-    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📊 Reports", "📋 CO-PO"])
+    
+    # --- FACULTY TABS (The core of v6.1) ---
+    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📋 CO-PO", "📈 Reports"])
 
     # 1. ATTENDANCE
     with tabs[0]:
@@ -397,8 +387,7 @@ def render_faculty_dashboard():
                 edt = st.data_editor(att, hide_index=True, key="att_edit")
                 if st.button("Submit Attd"):
                     recs = [{"Date":str(d_val), "Time":t_slot, "Faculty":selected_faculty, "Section":current_sec, "Code":current_code, "USN":r['USN'], "Status":"Present" if r['Present'] else "Absent"} for _,r in edt.iterrows()]
-                    safe_firestore_write(save_attendance_record, recs)
-                    st.success("Saved!")
+                    save_attendance_record(recs); st.success("Saved!")
             else: st.info("No students.")
 
     # 2. QUESTION PAPER
@@ -440,11 +429,11 @@ def render_faculty_dashboard():
         
         c1, c2 = st.columns(2)
         if c1.button("💾 Save Draft"):
-            safe_firestore_write(save_question_paper, current_code, exam_type, meta_data, qs_list, "Draft")
+            save_question_paper(current_code, exam_type, meta_data, qs_list, "Draft")
             st.success("Draft Saved.")
             
         if c2.button("🚀 Submit to HOD"):
-            safe_firestore_write(save_question_paper, current_code, exam_type, meta_data, qs_list, "Submitted")
+            save_question_paper(current_code, exam_type, meta_data, qs_list, "Submitted")
             st.success("Submitted to HOD!")
             st.rerun()
 
@@ -471,11 +460,24 @@ def render_faculty_dashboard():
                         for _, row in edited_marks.iterrows():
                             scores = {col: row[col] for col in q_cols}
                             recs.append({"USN": row['USN'], "Name": row['Name'], "Exam": exam_entry, "Subject": current_sub, "Code": current_code, "Scores": scores, "Total": sum(scores.values())})
-                        safe_firestore_write(save_ia_marks, recs, exam_entry, current_code)
+                        save_ia_marks(recs, exam_entry, current_code)
                         st.success("Marks Saved!")
 
-    # 4. REPORTS
-    with tabs[3]:
+    # 4. CO-PO (Manual Only)
+    with tabs[3]: 
+        st.markdown("### 📋 Course Articulation Matrix (CO-PO)")
+        cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
+        rows = [f"CO{i}" for i in range(1, 7)]
+        existing = fetch_copo_mapping(current_code)
+        if existing: df_copo = pd.DataFrame(existing)
+        else: df_copo = pd.DataFrame(0, index=rows, columns=cols); df_copo.insert(0, "CO_ID", rows)
+        edited_copo = st.data_editor(df_copo, hide_index=True, use_container_width=True, key="copo_edit")
+        if st.button("💾 Save CO-PO Mapping"):
+            save_copo_mapping(current_code, edited_copo.to_dict(orient='list'))
+            st.success("Mapping Saved!")
+
+    # 5. REPORTS
+    with tabs[4]:
         st.header("📈 Course Attainment Report")
         if st.button("Generate Report"):
             with st.spinner("Calculating..."):
@@ -492,19 +494,6 @@ def render_faculty_dashboard():
                     st.dataframe(pd.DataFrame(list(results['PO'].items()), columns=['PO', 'Attained Value']), hide_index=True)
             else:
                 st.error(msg)
-    
-    # 5. CO-PO
-    with tabs[4]: 
-        st.markdown("### 📋 Course Articulation Matrix (CO-PO)")
-        cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
-        rows = [f"CO{i}" for i in range(1, 7)]
-        existing = fetch_copo_mapping(current_code)
-        if existing: df_copo = pd.DataFrame(existing)
-        else: df_copo = pd.DataFrame(0, index=rows, columns=cols); df_copo.insert(0, "CO_ID", rows)
-        edited_copo = st.data_editor(df_copo, hide_index=True, use_container_width=True, key="copo_edit")
-        if st.button("💾 Save CO-PO Mapping"):
-            safe_firestore_write(save_copo_mapping, current_code, edited_copo.to_dict(orient='list'))
-            st.success("Mapping Saved!")
 
 def render_hod_scrutiny():
     st.subheader("🔍 HOD / Scrutiny Board")
@@ -532,6 +521,7 @@ def render_hod_scrutiny():
 def render_admin_space():
     st.subheader("⚙️ System Admin & Student Lifecycle")
     
+    # FULL 4 TABS RESTORED
     tabs = st.tabs(["🎓 Student Registration", "🚫 Detain/Manage", "🏫 Master Uploads", "📥 Global Reports"])
     
     # TAB 1: REGISTRATION
@@ -612,7 +602,7 @@ def render_admin_space():
     # TAB 4: REPORTS
     with tabs[3]:
         st.markdown("### 📥 Global Reports")
-        if st.button("Download Full Attendance"):
+        if st.button("Download Full Attendance Database"):
             df = fetch_collection_as_df('attendance_records')
             if not df.empty:
                 st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "full_data.csv", "text/csv")
