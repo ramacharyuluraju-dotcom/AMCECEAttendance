@@ -147,6 +147,23 @@ def fetch_copo_mapping(subject_code):
     doc = db.collection('co_po_mappings').document(subject_code).get()
     return doc.to_dict()['mapping'] if doc.exists else None
 
+# --- NEW: COURSE METADATA (Stable Implementation) ---
+def save_course_metadata(subject_code, co_statements):
+    doc_ref = db.collection('course_metadata').document(subject_code)
+    doc_ref.set({
+        "subject_code": subject_code,
+        "co_statements": co_statements,
+        "last_updated": datetime.now().strftime("%Y-%m-%d")
+    }, merge=True)
+    st.cache_data.clear()
+
+@st.cache_data(ttl=300)
+def fetch_course_metadata(subject_code):
+    doc = db.collection('course_metadata').document(subject_code).get()
+    if doc.exists:
+        return doc.to_dict()
+    return {}
+
 # --- HTML GENERATOR ---
 def generate_qp_html(meta, questions):
     rows_html = ""
@@ -223,7 +240,7 @@ def render_faculty_dashboard():
     current_code = class_info['Subject Code']
     
     st.divider()
-    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📊 Reports", "📋 CO-PO"])
+    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📊 Reports", "📋 CO-PO", "📘 Course File"])
 
     # 1. ATTENDANCE
     with tabs[0]:
@@ -319,6 +336,36 @@ def render_faculty_dashboard():
             safe_firestore_write(save_copo_mapping, current_code, edited_copo.to_dict(orient='list'))
             st.success("Saved!")
 
+    # 6. COURSE FILE (SAFE RE-INTEGRATION)
+    with tabs[5]:
+        st.markdown("### 📘 Course File & Planning")
+        cf_tabs = st.tabs(["CO Statements", "Download"])
+        
+        with cf_tabs[0]:
+            st.markdown("**Define CO Statements**")
+            meta = fetch_course_metadata(current_code)
+            co_texts = meta.get('co_statements', {})
+            
+            # Using unique keys based on Subject Code to prevent duplicate ID crashes
+            updated_cos = {}
+            for i in range(1, 7):
+                k = f"CO{i}"
+                val = co_texts.get(k, "")
+                updated_cos[k] = st.text_area(f"{k}", value=val, height=68, key=f"txt_{current_code}_{i}")
+            
+            if st.button("Save Statements"):
+                safe_firestore_write(save_course_metadata, current_code, updated_cos)
+                st.success("Saved.")
+
+        with cf_tabs[1]:
+            st.markdown("### Download Course File")
+            if st.button("Generate Report"):
+                report_txt = f"COURSE FILE: {current_sub}\nCODE: {current_code}\n"
+                report_txt += "-"*20 + "\n\nCO STATEMENTS:\n"
+                for k, v in updated_cos.items():
+                    report_txt += f"{k}: {v}\n"
+                st.download_button("Download Text File", report_txt, "course_file.txt")
+
 def render_hod():
     st.subheader("🔍 HOD")
     pending = fetch_pending_papers()
@@ -357,7 +404,7 @@ def render_admin():
             st.success("Done.")
 
 def main():
-    st.sidebar.title("RMS v7.2 (Stable)")
+    st.sidebar.title("RMS v7.3 (Stable)")
     menu = st.sidebar.radio("Role", ["Faculty Dashboard", "HOD / Scrutiny", "System Admin"])
     
     if menu == "Faculty Dashboard": render_faculty_dashboard()
