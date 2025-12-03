@@ -47,6 +47,7 @@ def delete_collection(coll_ref, batch_size):
         return delete_collection(coll_ref, batch_size)
 
 def upload_to_firestore(collection_name, df):
+    """Legacy upload for Subjects/Syllabus."""
     records = df.to_dict(orient='records')
     batch = db.batch()
     batch_count = 0
@@ -83,7 +84,7 @@ def save_attendance_record(records):
         doc_ref = collection_ref.document(unique_id)
         batch.set(doc_ref, record)
     batch.commit()
-    st.cache_data.clear() # Clear cache so history updates immediately
+    st.cache_data.clear()
 
 # --- NEW: IA, PATTERN & REPORT FUNCTIONS ---
 
@@ -102,7 +103,6 @@ def fetch_copo_mapping(subject_code):
     return None
 
 def save_assessment_pattern(subject_code, exam_type, pattern_data):
-    """Saves Q1->CO1 mapping."""
     uid = f"{subject_code}_{exam_type}"
     db.collection('assessment_patterns').document(uid).set({
         "subject_code": subject_code,
@@ -127,35 +127,26 @@ def save_ia_marks(records, exam_type, subject_code):
     batch.commit()
 
 def calculate_attainment(subject_code):
-    """
-    THE CORE ENGINE: Calculates CO and PO attainment.
-    """
-    # 1. Fetch IA Marks
+    # 1. Fetch Marks
     marks_ref = db.collection('ia_marks').where('Code', '==', subject_code).stream()
     marks_data = [d.to_dict() for d in marks_ref]
-    if not marks_data:
-        return None, "No marks found."
+    if not marks_data: return None, "No marks found."
     
-    # 2. Fetch Patterns (to know Max Marks & CO mapping)
+    # 2. Fetch Patterns
     patterns_ref = db.collection('assessment_patterns').where('subject_code', '==', subject_code).stream()
     patterns = {d.to_dict()['exam_type']: d.to_dict()['pattern'] for d in patterns_ref}
+    if not patterns: return None, "IA Pattern not configured."
+
+    # 3. Aggregate
+    student_co_scores = {} 
     
-    if not patterns:
-        return None, "No assessment pattern defined. Please configure IA Pattern."
-
-    # 3. Aggregation Containers
-    co_totals = {f"CO{i}": 0 for i in range(1, 7)}
-    co_max_totals = {f"CO{i}": 0 for i in range(1, 7)}
-    student_co_scores = {} # {USN: {CO1: obtained, CO1_max: max}}
-
-    # 4. Process Every Student Record
     for record in marks_data:
         exam = record['Exam']
         usn = record['USN']
-        scores = record['Scores'] # {Q1: 5, Q2: 8...}
+        scores = record['Scores']
         
         if exam not in patterns: continue
-        pattern = patterns[exam] # {Q1: {co: CO1, max: 10}...}
+        pattern = patterns[exam]
         
         if usn not in student_co_scores:
             student_co_scores[usn] = {f"CO{i}": 0 for i in range(1, 7)}
@@ -165,76 +156,111 @@ def calculate_attainment(subject_code):
             if q_key in pattern:
                 target_co = pattern[q_key]['co']
                 max_mark = pattern[q_key]['max']
-                
-                # Add to Student Total
                 student_co_scores[usn][target_co] += obtained_mark
                 student_co_scores[usn][f"{target_co}_max"] += max_mark
 
-    # 5. Calculate Attainment Level (Threshold: 60% of students scoring > 60%)
-    # Simplified Logic: Average % of class for this demo
+    # 4. CO Attainment Level
     co_attainment_results = {}
-    
     for co in [f"CO{i}" for i in range(1, 7)]:
         total_students = len(student_co_scores)
         if total_students == 0: continue
-        
-        students_passed_threshold = 0
-        
+        students_passed = 0
         for usn, data in student_co_scores.items():
             if data[f"{co}_max"] > 0:
-                percentage = (data[co] / data[f"{co}_max"]) * 100
-                if percentage >= 60: # Threshold
-                    students_passed_threshold += 1
+                if (data[co] / data[f"{co}_max"]) * 100 >= 60:
+                    students_passed += 1
         
-        attainment_percentage = (students_passed_threshold / total_students) * 100
-        
-        # Determine Level (1, 2, 3)
-        level = 0
-        if attainment_percentage >= 70: level = 3
-        elif attainment_percentage >= 60: level = 2
-        elif attainment_percentage >= 50: level = 1
-        
+        perc = (students_passed / total_students) * 100
+        if perc >= 70: level = 3
+        elif perc >= 60: level = 2
+        elif perc >= 50: level = 1
+        else: level = 0
         co_attainment_results[co] = level
 
-    # 6. Map to POs
+    # 5. PO Attainment
     copo_matrix = fetch_copo_mapping(subject_code)
     po_results = {}
-    
     if copo_matrix:
-        # copo_matrix is {PO1: [3, 2, 1...], PO2: ...} where index 0 is CO1
         for po_key, values in copo_matrix.items():
-            if po_key == "CO_ID": continue # Skip ID column
-            
+            if po_key == "CO_ID": continue
             weighted_sum = 0
             count = 0
-            
             for i, val in enumerate(values):
                 co_key = f"CO{i+1}"
                 if val and val > 0 and co_key in co_attainment_results:
                     weighted_sum += (val * co_attainment_results[co_key])
                     count += val
-            
-            if count > 0:
-                po_results[po_key] = round(weighted_sum / count, 2)
-            else:
-                po_results[po_key] = 0
+            po_results[po_key] = round(weighted_sum / count, 2) if count > 0 else 0
 
     return {"CO": co_attainment_results, "PO": po_results}, "Success"
+
+# --- STUDENT MANAGEMENT FUNCTIONS (v5.0 CORE) ---
+
+def register_students_bulk(df, ay, batch, semester, section):
+    """Registers students with metadata using USN as ID."""
+    records = df.to_dict(orient='records')
+    batch_write = db.batch()
+    coll_ref = db.collection('setup_students')
+    count = 0
+    
+    for rec in records:
+        # Standardize Data
+        usn = str(rec['USN']).strip().upper()
+        name = str(rec['Name']).strip()
+        
+        student_data = {
+            "USN": usn,
+            "Name": name,
+            "Academic_Year": ay,
+            "Batch": batch,
+            "Semester": semester,
+            "Section": section,
+            "Status": "Active", # Default status
+            "Last_Updated": datetime.now().strftime("%Y-%m-%d")
+        }
+        
+        # Use USN as Document ID (Prevents Duplicates automatically)
+        doc_ref = coll_ref.document(usn)
+        batch_write.set(doc_ref, student_data, merge=True)
+        count += 1
+        
+        if count % 400 == 0:
+            batch_write.commit()
+            batch_write = db.batch()
+            
+    if count > 0:
+        batch_write.commit()
+    return count
+
+def update_student_status(usn, status):
+    """Updates status to Active/Detained/Alumni"""
+    doc_ref = db.collection('setup_students').document(usn)
+    if doc_ref.get().exists:
+        doc_ref.update({"Status": status})
+        return True
+    return False
 
 # --- MODULES ---
 
 def render_faculty_dashboard():
     st.subheader("👨‍🏫 Faculty Dashboard")
     
-    # 1. GLOBAL FILTERS
     with st.spinner("Loading Data..."):
         df_subjects = fetch_collection_as_df('setup_subjects')
-        df_students = fetch_collection_as_df('setup_students')
+        df_students_raw = fetch_collection_as_df('setup_students')
     
     if df_subjects.empty:
-        st.warning("No subjects found.")
+        st.warning("No subjects configured.")
         return
 
+    # --- INTELLIGENT FILTERING ---
+    # Only show ACTIVE students to Faculty
+    if not df_students_raw.empty and 'Status' in df_students_raw.columns:
+        df_students = df_students_raw[df_students_raw['Status'] == 'Active']
+    else:
+        df_students = df_students_raw
+
+    # Faculty & Subject Selection
     faculty_list = sorted(df_subjects['Faculty Name'].unique().tolist())
     selected_faculty = st.selectbox("Select Faculty Name", faculty_list)
     
@@ -251,58 +277,66 @@ def render_faculty_dashboard():
     
     st.markdown("---")
     
-    # 2. TASK TABS
+    # Task Tabs
     tabs = st.tabs(["📝 Attendance", "📊 History", "⚙️ IA Pattern", "💯 IA Entry", "📊 CO-PO Mapping", "📈 Reports"])
 
-    # === ATTENDANCE ===
+    # 1. ATTENDANCE
     with tabs[0]:
-        st.markdown(f"**Attendance: {current_sub_name}**")
-        col1, col2 = st.columns(2)
-        with col1: date_val = st.date_input("Date", datetime.now())
-        with col2: time_slot = st.selectbox("Time", ["09:00-10:00", "10:00-11:00", "11:15-12:15", "12:15-01:15", "02:00-03:00"])
+        st.markdown(f"**Mark Attendance: {current_sub_name} ({current_section})**")
+        c1, c2 = st.columns(2)
+        with c1: date_val = st.date_input("Date", datetime.now())
+        with c2: time_slot = st.selectbox("Time", ["09:00-10:00", "10:00-11:00", "11:15-12:15", "12:15-01:15", "02:00-03:00"])
         
-        df_students['Section'] = df_students['Section'].astype(str).str.strip()
-        section_students = df_students[df_students['Section'] == current_section].copy()
-        
-        if not section_students.empty:
-            att_df = section_students[['USN', 'Name']].copy()
-            att_df['Present'] = True
-            edited_df = st.data_editor(att_df, column_config={"Present": st.column_config.CheckboxColumn(default=True)}, hide_index=True)
-            if st.button("Submit Attendance"):
-                records = [{"Date": str(date_val), "Time": time_slot, "Faculty": selected_faculty, "Section": current_section, "Code": current_sub_code, "USN": r['USN'], "Status": "Present" if r['Present'] else "Absent"} for _, r in edited_df.iterrows()]
-                save_attendance_record(records)
-                st.success("Saved!")
+        # Filter Logic
+        if not df_students.empty and 'Section' in df_students.columns:
+            df_students['Section'] = df_students['Section'].astype(str).str.strip()
+            # Match section strictly
+            section_students = df_students[df_students['Section'] == current_section].copy()
+            
+            if not section_students.empty:
+                att_df = section_students[['USN', 'Name']].copy()
+                att_df['Present'] = True
+                edited_df = st.data_editor(att_df, column_config={"Present": st.column_config.CheckboxColumn(default=True)}, hide_index=True)
+                
+                if st.button("Submit Attendance", type="primary"):
+                    records = []
+                    for _, row in edited_df.iterrows():
+                        records.append({
+                            "Date": str(date_val), "Time": time_slot, "Faculty": selected_faculty, 
+                            "Section": current_section, "Code": current_sub_code, 
+                            "USN": row['USN'], "Status": "Present" if row['Present'] else "Absent"
+                        })
+                    save_attendance_record(records)
+                    st.success("Attendance Saved!")
+            else:
+                st.info(f"No active students found in Section {current_section}.")
+        else:
+            st.warning("Student list empty. Please register students in System Admin.")
 
-    # === HISTORY ===
+    # 2. HISTORY
     with tabs[1]:
-        st.markdown(f"**Attendance History: {current_sub_name}**")
-        if st.button("🔄 Refresh History"):
+        st.markdown(f"**History: {current_sub_code}**")
+        if st.button("🔄 Load History"):
             all_recs = fetch_collection_as_df('attendance_records')
             if not all_recs.empty:
-                # Filter by subject
                 if 'Code' in all_recs.columns:
                     sub_recs = all_recs[all_recs['Code'] == current_sub_code]
                 else:
-                    sub_recs = all_recs # Fallback
+                    sub_recs = all_recs
                 
                 if not sub_recs.empty:
-                    st.dataframe(sub_recs.sort_values(by=['Date', 'Time'], ascending=False), use_container_width=True, hide_index=True)
+                    st.dataframe(sub_recs.sort_values(by=['Date', 'Time'], ascending=False), hide_index=True)
                     csv = sub_recs.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download Subject CSV", csv, f"attendance_{current_sub_code}.csv", "text/csv")
+                    st.download_button("📥 Download CSV", csv, "attendance.csv", "text/csv")
                 else:
-                    st.info("No records found for this subject.")
-            else:
-                st.info("Database is empty.")
+                    st.info("No history for this subject.")
 
-    # === IA PATTERN ===
+    # 3. IA PATTERN
     with tabs[2]:
         st.markdown("**Configure Assessment Pattern**")
-        st.info("Define the Question Paper structure (Max Marks & CO Mapping). Use 'Add Row' to add more sub-questions.")
+        exam_type_cfg = st.selectbox("Select Exam", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="cfg")
         
-        exam_type_cfg = st.selectbox("Select Exam to Configure", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="cfg_exam")
-        
-        # Pre-fill with standard sub-questions based on user request (1a, 1b...)
-        # Users can add/remove rows dynamically in the editor
+        # Default sub-questions
         if 'pattern_data' not in st.session_state:
              st.session_state.pattern_data = {
                 "Question": ["1a", "1b", "1c", "2a", "2b", "2c", "3a", "3b", "3c", "4a", "4b", "4c"],
@@ -310,11 +344,8 @@ def render_faculty_dashboard():
                 "Mapped CO": ["CO1", "CO1", "CO1", "CO2", "CO2", "CO2", "CO3", "CO3", "CO3", "CO4", "CO4", "CO4"]
             }
         
-        # Check if we already have a saved pattern to load instead of default
         saved_pat = fetch_assessment_pattern(current_sub_code, exam_type_cfg)
         if saved_pat:
-            # Convert saved dict back to list format for editor
-            # Saved: {'1a': {'max': 5, 'co': 'CO1'}, ...}
             qs = sorted(list(saved_pat.keys()))
             df_pattern = pd.DataFrame({
                 "Question": qs,
@@ -331,58 +362,53 @@ def render_faculty_dashboard():
                 "Max Marks": st.column_config.NumberColumn(min_value=0, max_value=20)
             },
             hide_index=True,
-            use_container_width=True,
-            num_rows="dynamic" # Allows adding/deleting rows (e.g. adding 5a)
+            num_rows="dynamic",
+            use_container_width=True
         )
         
         if st.button("💾 Save Pattern"):
-            # Convert DF to Dict {1a: {max: 5, co: CO1}}
             pat_dict = {}
             for _, row in edited_pattern.iterrows():
-                if row['Question'] and str(row['Question']).strip() != "":
+                if row['Question'] and str(row['Question']).strip():
                     pat_dict[str(row['Question']).strip()] = {"max": row['Max Marks'], "co": row['Mapped CO']}
-            
             save_assessment_pattern(current_sub_code, exam_type_cfg, pat_dict)
-            st.success(f"Pattern for {exam_type_cfg} Saved!")
+            st.success("Pattern Saved!")
 
-    # === IA ENTRY ===
+    # 4. IA ENTRY
     with tabs[3]:
         st.markdown(f"**Enter Marks: {current_sub_code}**")
-        exam_type_entry = st.selectbox("Select Assessment", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="entry_exam")
+        exam_type_entry = st.selectbox("Select Assessment", ["IA Test 1", "IA Test 2", "IA Test 3", "Assignment 1"], key="entry")
         
-        # Check if pattern exists
         pat = fetch_assessment_pattern(current_sub_code, exam_type_entry)
         if not pat:
-            st.error("⚠️ Pattern not defined for this exam. Go to 'IA Pattern' tab first!")
+            st.error("⚠️ Configure IA Pattern first.")
         else:
-            df_students['Section'] = df_students['Section'].astype(str).str.strip()
-            sec_stu = df_students[df_students['Section'] == current_section].copy()
-            
-            if not sec_stu.empty:
-                # Prepare Columns based on Pattern Keys (1a, 1b...)
-                # Natural sort attempt or just alpha sort
-                q_cols = sorted(list(pat.keys()))
+            if not df_students.empty:
+                df_students['Section'] = df_students['Section'].astype(str).str.strip()
+                sec_stu = df_students[df_students['Section'] == current_section].copy()
                 
-                marks_df = sec_stu[['USN', 'Name']].copy()
-                for q in q_cols:
-                    marks_df[q] = 0
-                
-                edited_marks = st.data_editor(marks_df, disabled=["USN", "Name"], hide_index=True)
-                
-                if st.button("💾 Submit Marks"):
-                    recs = []
-                    for _, row in edited_marks.iterrows():
-                        scores = {q: row[q] for q in q_cols}
-                        total = sum(scores.values())
-                        recs.append({
-                            "USN": row['USN'], "Name": row['Name'], "Exam": exam_type_entry,
-                            "Subject": current_sub_name, "Code": current_sub_code,
-                            "Scores": scores, "Total_Obtained": total, "Timestamp": datetime.now().strftime("%Y-%m-%d")
-                        })
-                    save_ia_marks(recs, exam_type_entry, current_sub_code)
-                    st.success("Marks Uploaded!")
+                if not sec_stu.empty:
+                    q_cols = sorted(list(pat.keys()))
+                    marks_df = sec_stu[['USN', 'Name']].copy()
+                    for q in q_cols: marks_df[q] = 0
+                    
+                    edited_marks = st.data_editor(marks_df, disabled=["USN", "Name"], hide_index=True)
+                    
+                    if st.button("💾 Submit Marks"):
+                        recs = []
+                        for _, row in edited_marks.iterrows():
+                            scores = {q: row[q] for q in q_cols}
+                            recs.append({
+                                "USN": row['USN'], "Name": row['Name'], "Exam": exam_type_entry,
+                                "Subject": current_sub_name, "Code": current_sub_code,
+                                "Scores": scores, "Total_Obtained": sum(scores.values()), "Timestamp": datetime.now().strftime("%Y-%m-%d")
+                            })
+                        save_ia_marks(recs, exam_type_entry, current_sub_code)
+                        st.success("Marks Uploaded!")
+            else:
+                st.info("No active students.")
 
-    # === CO-PO MAPPING ===
+    # 5. CO-PO
     with tabs[4]:
         st.markdown("**Course Articulation Matrix**")
         cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
@@ -400,65 +426,114 @@ def render_faculty_dashboard():
             save_copo_mapping(current_sub_code, edited_copo.to_dict(orient='list'))
             st.success("Saved!")
 
-    # === REPORTS ===
+    # 6. REPORTS
     with tabs[5]:
-        st.header("📈 Course Attainment Report")
+        st.header("📈 Attainment Report")
         if st.button("Generate Report"):
             with st.spinner("Calculating..."):
                 results, msg = calculate_attainment(current_sub_code)
-            
             if results:
-                st.success("Calculation Complete!")
-                
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.subheader("CO Attainment Levels")
-                    st.dataframe(pd.DataFrame(list(results['CO'].items()), columns=['CO', 'Level (0-3)']), hide_index=True)
-                
-                with col_b:
-                    st.subheader("Final PO Attainment")
-                    st.dataframe(pd.DataFrame(list(results['PO'].items()), columns=['PO', 'Attained Value']), hide_index=True)
-                    
-                st.markdown("---")
-                st.caption("*Logic: Level 3 if >70% students score >60%, Level 2 if >60%, Level 1 if >50%. PO = (CO-PO Mapping × CO Level) / 3*")
+                c1, c2 = st.columns(2)
+                c1.dataframe(pd.DataFrame(list(results['CO'].items()), columns=['CO', 'Level']), hide_index=True)
+                c2.dataframe(pd.DataFrame(list(results['PO'].items()), columns=['PO', 'Value']), hide_index=True)
             else:
                 st.error(msg)
 
 def render_admin_space():
-    st.subheader("⚙️ System Admin")
+    st.subheader("⚙️ System Admin & Student Lifecycle")
     
-    st.markdown("### 📥 Global Reports")
-    if st.button("Download Full Attendance Database"):
-        df = fetch_collection_as_df('attendance_records')
-        if not df.empty:
-            st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "full_attendance.csv", "text/csv")
-        else:
-            st.warning("No data found in attendance records.")
-            
-    st.divider()
+    tabs = st.tabs(["🎓 Student Registration", "🚫 Detain/Manage", "🏫 Master Uploads", "📥 Global Reports"])
+    
+    # TAB 1: REGISTRATION
+    with tabs[0]:
+        st.markdown("### 🎓 Register Students for Academic Year")
+        st.info("Use this to onboard new batches or add lateral entry students.")
+        
+        c1, c2, c3 = st.columns(3)
+        with c1: ay = st.selectbox("Academic Year", ["2023-24", "2024-25", "2025-26"], index=1)
+        with c2: batch = st.selectbox("Batch (Joining Year)", ["2021", "2022", "2023", "2024"])
+        with c3: sem = st.selectbox("Current Semester", [1, 2, 3, 4, 5, 6, 7, 8], index=2)
+        
+        target_section = st.text_input("Section to Assign (e.g., 3A, 5B)", placeholder="3A").strip()
+        
+        st.markdown("#### Option A: Bulk Upload (CSV)")
+        st.caption("Required Columns: `USN`, `Name`")
+        up_file = st.file_uploader("Upload Student List CSV", type=['csv'])
+        
+        if st.button("🚀 Register Batch"):
+            if up_file and target_section:
+                try:
+                    df = pd.read_csv(up_file)
+                    df.columns = df.columns.str.strip()
+                    # Basic validation
+                    if 'USN' in df.columns and 'Name' in df.columns:
+                        count = register_students_bulk(df, ay, batch, sem, target_section)
+                        st.success(f"Successfully registered {count} students to {target_section} (AY {ay}).")
+                    else:
+                        st.error("CSV must contain 'USN' and 'Name' columns.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.error("Please provide Section and File.")
 
-    with st.expander("Reset Data"):
-        if st.button("Wipe All Data"):
-            delete_collection(db.collection('setup_subjects'), 50)
-            delete_collection(db.collection('setup_students'), 50)
-            st.success("Wiped.")
-            st.rerun()
-            
-    c1, c2 = st.columns(2)
-    up_sub = c1.file_uploader("Subjects (Sheet 1)")
-    up_stu = c2.file_uploader("Students (Sheet 3)")
-    
-    if st.button("Initialize"):
-        if up_sub: upload_to_firestore('setup_subjects', pd.read_csv(up_sub))
-        if up_stu:
-            df = pd.read_csv(up_stu)
-            if 'Section' not in df.columns: df.rename(columns={df.columns[3]: 'Section'}, inplace=True)
-            upload_to_firestore('setup_students', df)
-        st.success("Done")
+        st.markdown("#### Option B: Single Student Entry")
+        with st.form("single_reg"):
+            s_usn = st.text_input("USN").strip().upper()
+            s_name = st.text_input("Name").strip()
+            if st.form_submit_button("Register Single Student"):
+                if s_usn and s_name and target_section:
+                    df_single = pd.DataFrame([{"USN": s_usn, "Name": s_name}])
+                    register_students_bulk(df_single, ay, batch, sem, target_section)
+                    st.success(f"Registered {s_name}!")
+                else:
+                    st.error("Missing fields.")
+
+    # TAB 2: MANAGE
+    with tabs[1]:
+        st.markdown("### 🚫 Manage Student Status")
+        search_q = st.text_input("Search USN").strip().upper()
+        if search_q:
+            doc = db.collection('setup_students').document(search_q).get()
+            if doc.exists:
+                d = doc.to_dict()
+                st.write(f"**{d.get('Name')}** ({d.get('Section')}) | Status: **{d.get('Status')}**")
+                new_stat = st.selectbox("Update Status", ["Active", "Detained", "Alumni", "Dropped"], index=0)
+                if st.button("Update Status"):
+                    update_student_status(search_q, new_stat)
+                    st.success("Updated!")
+            else:
+                st.warning("Student not found.")
+
+    # TAB 3: MASTER UPLOADS
+    with tabs[2]:
+        st.markdown("### 🏫 Master Data (Subjects)")
+        up_sub = st.file_uploader("Upload Subjects (Sheet 1)", type=['csv'])
+        if st.button("Upload Subjects"):
+            if up_sub:
+                c = upload_to_firestore('setup_subjects', pd.read_csv(up_sub))
+                st.success(f"Uploaded {c} subjects.")
+
+        st.divider()
+        with st.expander("⚠️ Danger Zone"):
+            st.warning("Only use this to wipe the entire database for a fresh start.")
+            if st.button("🗑️ Wipe ALL Data"):
+                delete_collection(db.collection('setup_subjects'), 50)
+                delete_collection(db.collection('setup_students'), 50)
+                st.success("Database Wiped.")
+
+    # TAB 4: REPORTS
+    with tabs[3]:
+        st.markdown("### 📥 Global Reports")
+        if st.button("Download Full Attendance"):
+            df = fetch_collection_as_df('attendance_records')
+            if not df.empty:
+                st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "full_data.csv", "text/csv")
+            else:
+                st.info("No data.")
 
 def main():
-    st.sidebar.title("RMS v4.0")
-    menu = st.sidebar.radio("Menu", ["Faculty Dashboard", "System Admin"])
+    st.sidebar.title("RMS v5.0")
+    menu = st.sidebar.radio("Navigate", ["Faculty Dashboard", "System Admin"])
     if menu == "Faculty Dashboard": render_faculty_dashboard()
     elif menu == "System Admin": render_admin_space()
 
