@@ -38,9 +38,6 @@ db = firestore.client()
 
 def generate_qp_html(meta, questions):
     """Generates the Standardized HTML Question Paper."""
-    # Group questions by main number if needed, or just list them.
-    # For this format, we list them in a table.
-    
     rows_html = ""
     for q in questions:
         rows_html += f"""
@@ -131,9 +128,18 @@ def generate_qp_html(meta, questions):
 
 # --- DATABASE OPERATIONS ---
 
+def delete_collection(coll_ref, batch_size):
+    """Deletes all documents in a collection."""
+    docs = coll_ref.limit(batch_size).stream()
+    deleted = 0
+    for doc in docs:
+        doc.reference.delete()
+        deleted += 1
+    if deleted >= batch_size:
+        return delete_collection(coll_ref, batch_size)
+
 def save_question_paper(subject_code, exam_type, meta, questions, status="Draft"):
     uid = f"{subject_code}_{exam_type}"
-    # Calculate Max Marks from questions
     total_marks = sum([int(q['marks']) for q in questions if str(q['marks']).isdigit()])
     meta['maxMarks'] = total_marks
     
@@ -156,7 +162,6 @@ def fetch_question_paper(subject_code, exam_type):
     return None
 
 def fetch_pending_papers():
-    """Fetches papers with status 'Submitted'."""
     docs = db.collection('question_papers').where('status', '==', 'Submitted').stream()
     return [d.to_dict() for d in docs]
 
@@ -164,7 +169,24 @@ def approve_paper(subject_code, exam_type):
     uid = f"{subject_code}_{exam_type}"
     db.collection('question_papers').document(uid).update({"status": "Approved"})
 
-# --- EXISTING FUNCTIONS (Kept for continuity) ---
+def upload_to_firestore(collection_name, df):
+    records = df.to_dict(orient='records')
+    batch = db.batch()
+    batch_count = 0
+    coll_ref = db.collection(collection_name)
+    
+    for i, record in enumerate(records):
+        doc_ref = coll_ref.document(str(i))
+        batch.set(doc_ref, record)
+        batch_count += 1
+        if batch_count >= 400:
+            batch.commit()
+            batch = db.batch()
+            batch_count = 0
+    if batch_count > 0:
+        batch.commit()
+    return i + 1
+
 def fetch_collection_as_df(col):
     docs = db.collection(col).stream()
     data = [doc.to_dict() for doc in docs]
@@ -190,6 +212,38 @@ def save_copo_mapping(subject_code, mapping_data):
 def fetch_copo_mapping(subject_code):
     doc = db.collection('co_po_mappings').document(subject_code).get()
     return doc.to_dict()['mapping'] if doc.exists else None
+
+# --- STUDENT MANAGEMENT FUNCTIONS (Restored) ---
+
+def register_students_bulk(df, ay, batch, semester, section):
+    """Registers students with metadata using USN as ID."""
+    records = df.to_dict(orient='records')
+    batch_write = db.batch()
+    coll_ref = db.collection('setup_students')
+    count = 0
+    
+    for rec in records:
+        usn = str(rec['USN']).strip().upper()
+        name = str(rec['Name']).strip()
+        student_data = {
+            "USN": usn, "Name": name, "Academic_Year": ay, "Batch": batch,
+            "Semester": semester, "Section": section, "Status": "Active",
+            "Last_Updated": datetime.now().strftime("%Y-%m-%d")
+        }
+        batch_write.set(coll_ref.document(usn), student_data, merge=True)
+        count += 1
+        if count % 400 == 0:
+            batch_write.commit()
+            batch_write = db.batch()
+    if count > 0: batch_write.commit()
+    return count
+
+def update_student_status(usn, status):
+    doc_ref = db.collection('setup_students').document(usn)
+    if doc_ref.get().exists:
+        doc_ref.update({"Status": status})
+        return True
+    return False
 
 # --- UI MODULES ---
 
@@ -338,7 +392,7 @@ def render_faculty_dashboard():
                         save_ia_marks(recs, exam_entry, current_code)
                         st.success("Marks Saved!")
 
-    # 4. REPORTS (Placeholder for brevity, same logic as v5)
+    # 4. REPORTS
     with tabs[3]: st.info("Attainment reports use data from Approved Question Papers + IA Marks.")
     with tabs[4]: 
         st.info("CO-PO Mapping")
@@ -367,18 +421,105 @@ def render_hod_scrutiny():
                 st.success(f"Approved {p['meta']['courseCode']}!")
                 st.rerun()
 
+def render_admin_space():
+    st.subheader("⚙️ System Admin & Student Lifecycle")
+    
+    tabs = st.tabs(["🎓 Student Registration", "🚫 Detain/Manage", "🏫 Master Uploads", "📥 Global Reports"])
+    
+    # TAB 1: REGISTRATION
+    with tabs[0]:
+        st.markdown("### 🎓 Register Students for Academic Year")
+        st.info("Use this to onboard new batches or add lateral entry students.")
+        
+        c1, c2, c3 = st.columns(3)
+        with c1: ay = st.selectbox("Academic Year", ["2023-24", "2024-25", "2025-26"], index=1)
+        with c2: batch = st.selectbox("Batch (Joining Year)", ["2021", "2022", "2023", "2024"])
+        with c3: sem = st.selectbox("Current Semester", [1, 2, 3, 4, 5, 6, 7, 8], index=2)
+        
+        target_section = st.text_input("Section to Assign (e.g., 3A, 5B)", placeholder="3A").strip()
+        
+        st.markdown("#### Option A: Bulk Upload (CSV)")
+        st.caption("Required Columns: `USN`, `Name`")
+        up_file = st.file_uploader("Upload Student List CSV", type=['csv'])
+        
+        if st.button("🚀 Register Batch"):
+            if up_file and target_section:
+                try:
+                    df = pd.read_csv(up_file)
+                    df.columns = df.columns.str.strip()
+                    # Basic validation
+                    if 'USN' in df.columns and 'Name' in df.columns:
+                        count = register_students_bulk(df, ay, batch, sem, target_section)
+                        st.success(f"Successfully registered {count} students to {target_section} (AY {ay}).")
+                    else:
+                        st.error("CSV must contain 'USN' and 'Name' columns.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.error("Please provide Section and File.")
+
+        st.markdown("#### Option B: Single Student Entry")
+        with st.form("single_reg"):
+            s_usn = st.text_input("USN").strip().upper()
+            s_name = st.text_input("Name").strip()
+            if st.form_submit_button("Register Single Student"):
+                if s_usn and s_name and target_section:
+                    df_single = pd.DataFrame([{"USN": s_usn, "Name": s_name}])
+                    register_students_bulk(df_single, ay, batch, sem, target_section)
+                    st.success(f"Registered {s_name}!")
+                else:
+                    st.error("Missing fields.")
+
+    # TAB 2: MANAGE
+    with tabs[1]:
+        st.markdown("### 🚫 Manage Student Status")
+        search_q = st.text_input("Search USN").strip().upper()
+        if search_q:
+            doc = db.collection('setup_students').document(search_q).get()
+            if doc.exists:
+                d = doc.to_dict()
+                st.write(f"**{d.get('Name')}** ({d.get('Section')}) | Status: **{d.get('Status')}**")
+                new_stat = st.selectbox("Update Status", ["Active", "Detained", "Alumni", "Dropped"], index=0)
+                if st.button("Update Status"):
+                    update_student_status(search_q, new_stat)
+                    st.success("Updated!")
+            else:
+                st.warning("Student not found.")
+
+    # TAB 3: MASTER UPLOADS
+    with tabs[2]:
+        st.markdown("### 🏫 Master Data (Subjects)")
+        up_sub = st.file_uploader("Upload Subjects (Sheet 1)", type=['csv'])
+        if st.button("Upload Subjects"):
+            if up_sub:
+                c = upload_to_firestore('setup_subjects', pd.read_csv(up_sub))
+                st.success(f"Uploaded {c} subjects.")
+
+        st.divider()
+        with st.expander("⚠️ Danger Zone"):
+            st.warning("Only use this to wipe the entire database for a fresh start.")
+            if st.button("🗑️ Wipe ALL Data"):
+                delete_collection(db.collection('setup_subjects'), 50)
+                delete_collection(db.collection('setup_students'), 50)
+                st.success("Database Wiped.")
+
+    # TAB 4: REPORTS
+    with tabs[3]:
+        st.markdown("### 📥 Global Reports")
+        if st.button("Download Full Attendance"):
+            df = fetch_collection_as_df('attendance_records')
+            if not df.empty:
+                st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "full_data.csv", "text/csv")
+            else:
+                st.info("No data.")
+
 def main():
-    st.sidebar.title("RMS v6.0")
+    st.sidebar.title("RMS v6.1")
     menu = st.sidebar.radio("Role", ["Faculty Dashboard", "HOD / Scrutiny", "System Admin"])
     
     if menu == "Faculty Dashboard": render_faculty_dashboard()
     elif menu == "HOD / Scrutiny": render_hod_scrutiny()
-    elif menu == "System Admin": 
-        # Reuse Admin from v5
-        st.subheader("System Admin")
-        up = st.file_uploader("Upload Subjects")
-        if st.button("Init") and up: 
-            upload_to_firestore('setup_subjects', pd.read_csv(up)); st.success("Done")
+    elif menu == "System Admin": render_admin_space()
 
 if __name__ == "__main__":
     main()
