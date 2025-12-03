@@ -193,11 +193,26 @@ def fetch_collection_as_df(col):
     return pd.DataFrame(data) if data else pd.DataFrame()
 
 def save_attendance_record(records):
+    """
+    STRICT DUPLICATE PREVENTION LOGIC
+    It checks using a deterministic ID. If ID exists, it overwrites (updates).
+    """
     batch = db.batch()
+    collection_ref = db.collection('attendance_records')
+    
     for r in records:
-        uid = f"{r['Date']}_{r['Section']}_{r['Code']}_{r['Time']}_{r['USN']}".replace(" ","").replace("/","-")
-        batch.set(db.collection('attendance_records').document(uid), r)
+        # Create a deterministic ID: DATE_SECTION_CODE_TIME_USN
+        # This ensures that for a specific class slot, a student can have ONLY ONE record.
+        unique_id = f"{r['Date']}_{r['Section']}_{r['Code']}_{r['Time']}_{r['USN']}"
+        unique_id = unique_id.replace(" ", "").replace("/", "-").replace(":", "")
+        
+        doc_ref = collection_ref.document(unique_id)
+        # Using .set() with the same ID will overwrite the existing doc, preventing duplicates
+        batch.set(doc_ref, r)
+        
     batch.commit()
+    # Explicitly clear cache to show new data immediately
+    st.cache_data.clear()
 
 def save_ia_marks(records, exam_type, subject_code):
     batch = db.batch()
