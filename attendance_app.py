@@ -394,9 +394,27 @@ def render_faculty_dashboard():
 
     # 4. REPORTS
     with tabs[3]: st.info("Attainment reports use data from Approved Question Papers + IA Marks.")
+    
+    # 5. CO-PO (RESTORED)
     with tabs[4]: 
-        st.info("CO-PO Mapping")
-        # Reuse CO-PO logic from v5 here if needed
+        st.markdown("### 📋 Course Articulation Matrix (CO-PO)")
+        st.info("Map Course Outcomes (COs) to Program Outcomes (POs). Level: 1 (Low), 2 (Medium), 3 (High).")
+        
+        cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
+        rows = [f"CO{i}" for i in range(1, 7)]
+        
+        existing = fetch_copo_mapping(current_code)
+        if existing:
+            df_copo = pd.DataFrame(existing)
+        else:
+            df_copo = pd.DataFrame(0, index=rows, columns=cols)
+            df_copo.insert(0, "CO_ID", rows)
+            
+        edited_copo = st.data_editor(df_copo, hide_index=True, use_container_width=True)
+        
+        if st.button("💾 Save CO-PO Mapping"):
+            save_copo_mapping(current_code, edited_copo.to_dict(orient='list'))
+            st.success("Mapping Saved Successfully!")
 
 def render_hod_scrutiny():
     st.subheader("🔍 HOD / Scrutiny Board")
