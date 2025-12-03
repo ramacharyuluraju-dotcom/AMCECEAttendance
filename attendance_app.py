@@ -213,24 +213,7 @@ def fetch_copo_mapping(subject_code):
     doc = db.collection('co_po_mappings').document(subject_code).get()
     return doc.to_dict()['mapping'] if doc.exists else None
 
-# --- NEW: COURSE METADATA (COs & Syllabus) ---
-
-def save_course_metadata(subject_code, co_statements):
-    """Saves CO definitions (text) for a subject."""
-    doc_ref = db.collection('course_metadata').document(subject_code)
-    doc_ref.set({
-        "subject_code": subject_code,
-        "co_statements": co_statements, # Dict {CO1: "Text...", CO2: ...}
-        "last_updated": datetime.now().strftime("%Y-%m-%d")
-    }, merge=True)
-
-def fetch_course_metadata(subject_code):
-    doc = db.collection('course_metadata').document(subject_code).get()
-    if doc.exists:
-        return doc.to_dict()
-    return {}
-
-# --- STUDENT MANAGEMENT FUNCTIONS (Restored) ---
+# --- STUDENT MANAGEMENT FUNCTIONS ---
 
 def register_students_bulk(df, ay, batch, semester, section):
     """Registers students with metadata using USN as ID."""
@@ -293,7 +276,7 @@ def render_faculty_dashboard():
     current_code = class_info['Subject Code']
     
     st.divider()
-    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📘 Course File", "📊 Reports", "📋 CO-PO"])
+    tabs = st.tabs(["📝 Attendance", "📄 Question Paper", "💯 IA Entry", "📊 Reports", "📋 CO-PO"])
 
     # 1. ATTENDANCE
     with tabs[0]:
@@ -398,66 +381,11 @@ def render_faculty_dashboard():
                         save_ia_marks(recs, exam_entry, current_code)
                         st.success("Marks Saved!")
 
-    # 4. COURSE FILE (NEW)
-    with tabs[3]:
-        st.markdown("### 📘 Course File & Planning")
-        
-        cf_tabs = st.tabs(["Define COs", "Syllabus", "Download File"])
-        
-        # A. CO Definition
-        with cf_tabs[0]:
-            st.markdown("**Define Course Outcomes (Text)**")
-            st.caption("Write the actual statement for each CO. This will appear in reports.")
-            
-            # Load existing
-            meta = fetch_course_metadata(current_code)
-            co_texts = meta.get('co_statements', {f"CO{i}": "" for i in range(1,7)})
-            
-            updated_cos = {}
-            for i in range(1, 7):
-                co_key = f"CO{i}"
-                # FIXED: Added unique key for widget to prevent crashes
-                default_text = co_texts.get(co_key) if co_texts.get(co_key) else ""
-                updated_cos[co_key] = st.text_area(f"{co_key}", value=default_text, height=70, key=f"txt_{current_code}_{co_key}")
-            
-            if st.button("💾 Save CO Statements"):
-                save_course_metadata(current_code, updated_cos)
-                st.success("Statements Saved!")
-
-        # B. Syllabus
-        with cf_tabs[1]:
-            st.markdown("**Syllabus Reference**")
-            # If syllabus was uploaded in System Admin (Sheet 2), try to find relevant rows
-            df_syl = fetch_collection_as_df('setup_syllabus') # You need to ensure this collection exists
-            # Note: In previous versions we didn't fully implement 'setup_syllabus' fetching logic
-            # This is a placeholder for that feature
-            st.info("Upload your syllabus PDF here for quick reference (Feature coming soon). For now, refer to System Admin uploads.")
-
-        # C. Download
-        with cf_tabs[2]:
-            st.markdown("**📥 Download Digital Course File**")
-            st.caption("Generates a complete report including COs, Mapping, Attendance Summary, and Marks.")
-            
-            if st.button("Generate Course File (PDF/HTML)"):
-                # Simplified: Just dump data for now
-                co_map = fetch_copo_mapping(current_code)
-                co_txt = fetch_course_metadata(current_code).get('co_statements', {})
-                
-                # Create a simple summary text
-                report = f"COURSE FILE: {current_sub} ({current_code})\n"
-                report += f"Faculty: {selected_faculty}\n"
-                report += "-"*30 + "\n\n"
-                report += "COURSE OUTCOMES:\n"
-                for k, v in co_txt.items():
-                    report += f"{k}: {v}\n"
-                
-                st.download_button("Download Report.txt", report, f"CourseFile_{current_code}.txt")
-
-    # 5. REPORTS
-    with tabs[4]: st.info("Attainment reports logic.")
+    # 4. REPORTS
+    with tabs[3]: st.info("Attainment reports use data from Approved Question Papers + IA Marks.")
     
-    # 6. CO-PO
-    with tabs[5]: 
+    # 5. CO-PO
+    with tabs[4]: 
         st.markdown("### 📋 Course Articulation Matrix (CO-PO)")
         cols = [f"PO{i}" for i in range(1, 13)] + ["PSO1", "PSO2"]
         rows = [f"CO{i}" for i in range(1, 7)]
