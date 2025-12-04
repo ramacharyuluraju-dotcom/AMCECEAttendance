@@ -28,45 +28,58 @@ def get_db():
 
 db = get_db()
 
-# ============================= OPTIMIZED FETCH FUNCTIONS =============================
+# ============================= FETCH FUNCTIONS =============================
 
 @st.cache_data(ttl=86400) # Cache Faculty List for 24 Hours
 def get_all_faculty_names():
-    """Reads all subjects ONCE a day to get unique faculty names."""
-    docs = db.collection('setup_subjects').stream()
-    return sorted(list(set(d.to_dict().get('Faculty Name', '') for d in docs if d.to_dict().get('Faculty Name'))))
+    """Reads all subjects ONCE a day."""
+    try:
+        docs = db.collection('setup_subjects').stream()
+        # Use simple string key access
+        return sorted(list(set(d.to_dict().get('Faculty Name', '') for d in docs if d.to_dict().get('Faculty Name'))))
+    except Exception as e:
+        return []
 
 @st.cache_data(ttl=3600) # Cache Subject List for 1 Hour
 def get_subjects_for_faculty(faculty_name):
-    """Fetches ONLY the subjects assigned to a specific faculty."""
     if not faculty_name: return pd.DataFrame()
-    docs = db.collection('setup_subjects').where('Faculty Name', '==', faculty_name.strip()).stream()
-    data = [d.to_dict() for d in docs]
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df['Display_Label'] = df['Section'].astype(str).str.upper() + " - " + df['Subject Name']
-    return df
+    try:
+        # Standard query - Firestore handles spaces in strings fine usually
+        docs = db.collection('setup_subjects').where('Faculty Name', '==', faculty_name.strip()).stream()
+        data = [d.to_dict() for d in docs]
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df['Display_Label'] = df['Section'].astype(str).str.upper() + " - " + df['Subject Name']
+        return df
+    except Exception:
+        # Fallback: Fetch all and filter in Python (1 read per doc, but safe)
+        all_docs = db.collection('setup_subjects').stream()
+        data = [d.to_dict() for d in all_docs if d.to_dict().get('Faculty Name') == faculty_name.strip()]
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df['Display_Label'] = df['Section'].astype(str).str.upper() + " - " + df['Subject Name']
+        return df
 
-@st.cache_data(ttl=3600) # Cache Student List for 1 Hour
+@st.cache_data(ttl=3600) # Cache Student List
 def get_active_students_in_section(section):
-    """Fetches ONLY active students in a specific section."""
     section = str(section).strip().upper()
-    # Note: Requires Composite Index if filtering by multiple fields. 
-    # For simplicity/safety, we filter Status in python if index missing, but query Section at DB level.
-    docs = db.collection('setup_students').where('Section', '==', section).stream()
-    data = [d.to_dict() for d in docs]
-    if not data: return pd.DataFrame(columns=['USN', 'Name'])
-    
-    df = pd.DataFrame(data)
-    # Filter Active locally to avoid index issues for now
-    if 'Status' in df.columns:
-        df = df[df['Status'] == 'Active']
-    return df[['USN', 'Name']].sort_values('USN')
+    try:
+        docs = db.collection('setup_students').where('Section', '==', section).stream()
+        data = [d.to_dict() for d in docs]
+        if not data: return pd.DataFrame(columns=['USN', 'Name'])
+        df = pd.DataFrame(data)
+        if 'Status' in df.columns:
+            df = df[df['Status'] == 'Active']
+        return df[['USN', 'Name']].sort_values('USN')
+    except:
+        return pd.DataFrame(columns=['USN', 'Name'])
 
-@st.cache_data(ttl=60) # Fast refresh for Pending Papers
+@st.cache_data(ttl=60)
 def get_pending_question_papers():
-    docs = db.collection('question_papers').where('status', '==', 'Submitted').stream()
-    return [d.to_dict() for d in docs]
+    try:
+        docs = db.collection('question_papers').where('status', '==', 'Submitted').stream()
+        return [d.to_dict() for d in docs]
+    except: return []
 
 @st.cache_data(ttl=60)
 def fetch_question_paper(subject_code, exam_type):
@@ -79,14 +92,14 @@ def fetch_copo_mapping(subject_code):
     doc = db.collection('co_po_mappings').document(subject_code).get()
     return doc.to_dict()['mapping'] if doc.exists else None
 
-# --- DATABASE WRITES (SAFE) ---
+# --- WRITE OPS ---
 
 def safe_write(func, *args, **kwargs):
     try:
         func(*args, **kwargs)
         return True
     except Exception as e:
-        if "Quota" in str(e): st.error("Quota Exceeded. Try tomorrow.")
+        if "Quota" in str(e): st.error("Quota Exceeded.")
         else: st.error(f"Error: {e}")
         return False
 
@@ -96,7 +109,6 @@ def save_attendance_record(records):
         uid = f"{r['Date']}_{r['Section']}_{r['Code']}_{r['Time']}_{r['USN']}".replace(" ","").replace("/","-")
         batch.set(db.collection('attendance_records').document(uid), r)
     batch.commit()
-    # No cache clear needed!
 
 def save_ia_marks(records, exam_type, subject_code):
     batch = db.batch()
@@ -111,7 +123,7 @@ def save_question_paper(subject_code, exam_type, meta, questions, status="Draft"
     meta['maxMarks'] = total
     data = {"subject_code": subject_code, "exam_type": exam_type, "meta": meta, "questions": questions, "status": status, "timestamp": datetime.now().isoformat()}
     db.collection('question_papers').document(uid).set(data)
-    fetch_question_paper.clear() # Clear specific cache
+    fetch_question_paper.clear()
     if status == 'Submitted': get_pending_question_papers.clear()
 
 def approve_paper(subject_code, exam_type):
@@ -140,7 +152,7 @@ def upload_to_firestore(collection_name, df):
         c += 1
         if c >= 400: batch.commit(); batch = db.batch(); c=0
     if c > 0: batch.commit()
-    get_all_faculty_names.clear() # Clear cache only on Admin upload
+    get_all_faculty_names.clear()
     return i+1
 
 def register_students_bulk(df, ay, batch_yr, sem, sec):
@@ -150,12 +162,21 @@ def register_students_bulk(df, ay, batch_yr, sem, sec):
     for r in records:
         usn = str(r['USN']).strip().upper()
         data = {"USN": usn, "Name": str(r['Name']).strip(), "AY": ay, "Batch": batch_yr, "Sem": sem, "Section": sec, "Status": "Active"}
+        # Use USN as Doc ID for easier management
         batch.set(coll.document(usn), data, merge=True)
         c += 1
         if c >= 400: batch.commit(); batch = db.batch(); c=0
     if c > 0: batch.commit()
     get_active_students_in_section.clear()
     return c
+
+def update_student_status(usn, status):
+    doc_ref = db.collection('setup_students').document(usn)
+    if doc_ref.get().exists:
+        doc_ref.update({"Status": status})
+        get_active_students_in_section.clear()
+        return True
+    return False
 
 def delete_collection(coll_ref, limit=50):
     docs = coll_ref.limit(limit).stream()
@@ -165,62 +186,61 @@ def delete_collection(coll_ref, limit=50):
 
 # --- REPORT ENGINE ---
 def calculate_attainment(subject_code):
-    # 1. Get Marks (Direct Query)
-    marks_ref = db.collection('ia_marks').where('Code', '==', subject_code).stream()
-    marks_data = [d.to_dict() for d in marks_ref]
-    if not marks_data: return None, "No marks found."
-    
-    # 2. Get Patterns
-    exam_types = set(m['Exam'] for m in marks_data)
-    patterns = {}
-    for et in exam_types:
-        qp = fetch_question_paper(subject_code, et)
-        if qp and qp.get('status') == 'Approved':
-            patterns[et] = {str(q['qNo']): {'co': q['co'], 'max': int(q['marks'])} for q in qp['questions']}
-    
-    if not patterns: return None, "No Approved QP found."
+    try:
+        marks_ref = db.collection('ia_marks').where('Code', '==', subject_code).stream()
+        marks_data = [d.to_dict() for d in marks_ref]
+        if not marks_data: return None, "No marks found."
+        
+        exam_types = set(m['Exam'] for m in marks_data)
+        patterns = {}
+        for et in exam_types:
+            qp = fetch_question_paper(subject_code, et)
+            if qp and qp.get('status') == 'Approved':
+                patterns[et] = {str(q['qNo']): {'co': q['co'], 'max': int(q['marks'])} for q in qp['questions']}
+        
+        if not patterns: return None, "No Approved QP found."
 
-    # 3. Calc
-    stu_scores = {}
-    for r in marks_data:
-        ex, usn, sc = r['Exam'], r['USN'], r['Scores']
-        if ex not in patterns: continue
-        pat = patterns[ex]
-        if usn not in stu_scores: 
-            stu_scores[usn] = {f"CO{i}":0 for i in range(1,7)}; stu_scores[usn].update({f"CO{i}_max":0 for i in range(1,7)})
-        for q, m in sc.items():
-            if q in pat:
-                co, mx = pat[q]['co'], pat[q]['max']
-                stu_scores[usn][co] += m
-                stu_scores[usn][f"{co}_max"] += mx
+        stu_scores = {}
+        for r in marks_data:
+            ex, usn, sc = r['Exam'], r['USN'], r['Scores']
+            if ex not in patterns: continue
+            pat = patterns[ex]
+            if usn not in stu_scores: 
+                stu_scores[usn] = {f"CO{i}":0 for i in range(1,7)}; stu_scores[usn].update({f"CO{i}_max":0 for i in range(1,7)})
+            for q, m in sc.items():
+                if q in pat:
+                    co, mx = pat[q]['co'], pat[q]['max']
+                    stu_scores[usn][co] += m
+                    stu_scores[usn][f"{co}_max"] += mx
 
-    co_res = {}
-    for co in [f"CO{i}" for i in range(1,7)]:
-        passed = sum(1 for d in stu_scores.values() if d[f"{co}_max"]>0 and (d[co]/d[f"{co}_max"]*100)>=60)
-        total = len(stu_scores)
-        perc = (passed/total*100) if total else 0
-        co_res[co] = 3 if perc>=70 else 2 if perc>=60 else 1 if perc>=50 else 0
+        co_res = {}
+        for co in [f"CO{i}" for i in range(1,7)]:
+            passed = sum(1 for d in stu_scores.values() if d[f"{co}_max"]>0 and (d[co]/d[f"{co}_max"]*100)>=60)
+            total = len(stu_scores)
+            perc = (passed/total*100) if total else 0
+            co_res[co] = 3 if perc>=70 else 2 if perc>=60 else 1 if perc>=50 else 0
 
-    copo = fetch_copo_mapping(subject_code)
-    po_res = {}
-    if copo:
-        for po, vals in copo.items():
-            if po=="CO_ID": continue
-            w_sum=0; count=0
-            for i, v in enumerate(vals):
-                co_k = f"CO{i+1}"
-                v_int = int(v) if str(v).isdigit() else 0
-                if v_int>0 and co_k in co_res: w_sum+=v_int*co_res[co_k]; count+=v_int
-            po_res[po] = round(w_sum/count, 2) if count>0 else 0
-            
-    return {"CO": co_res, "PO": po_res}, "Success"
+        copo = fetch_copo_mapping(subject_code)
+        po_res = {}
+        if copo:
+            for po, vals in copo.items():
+                if po=="CO_ID": continue
+                w_sum=0; count=0
+                for i, v in enumerate(vals):
+                    co_k = f"CO{i+1}"
+                    v_int = int(v) if str(v).isdigit() else 0
+                    if v_int>0 and co_k in co_res: w_sum+=v_int*co_res[co_k]; count+=v_int
+                po_res[po] = round(w_sum/count, 2) if count>0 else 0
+                
+        return {"CO": co_res, "PO": po_res}, "Success"
+    except Exception as e:
+        return None, str(e)
 
 # --- UI RENDERING ---
 
 def render_faculty_dashboard():
     st.subheader("👨‍🏫 Faculty Dashboard")
     
-    # OPTIMIZED LOADER
     faculty_names = get_all_faculty_names()
     if not faculty_names: st.error("System Empty. Contact Admin."); return
     
@@ -235,7 +255,6 @@ def render_faculty_dashboard():
     cur_sub = cls_info['Subject Name']
     cur_code = cls_info['Subject Code']
     
-    # OPTIMIZED STUDENT FETCH
     df_students = get_active_students_in_section(cur_sec)
     
     st.write(f"Active Students: {len(df_students)}")
@@ -299,7 +318,6 @@ def render_faculty_dashboard():
             if up_cp:
                 try:
                     df_up = pd.read_csv(up_cp).fillna(0)
-                    # Simplified mapping logic for upload
                     safe_write(save_copo_mapping, cur_code, df_up.to_dict('list'))
                     st.success("Uploaded!"); st.rerun()
                 except: st.error("Invalid CSV")
@@ -331,21 +349,41 @@ def render_hod_scrutiny():
 
 def render_admin_space():
     st.subheader("Admin")
-    t1, t2, t3 = st.tabs(["Register", "Uploads", "Full Report"])
+    t1, t2, t3 = st.tabs(["Register", "Uploads", "Manage"])
+    
+    # 1. REGISTER
     with t1:
         c1, c2, c3 = st.columns(3)
         ay = c1.selectbox("AY", ["24-25"]); sem = c2.selectbox("Sem", [1,2,3,4,5,6,7,8]); sec = c3.text_input("Sec", "A")
         up = st.file_uploader("Student CSV", type=['csv'])
         if st.button("Register") and up: 
             c = register_students_bulk(pd.read_csv(up), ay, "2023", sem, sec); st.success(f"Added {c}")
+    
+    # 2. UPLOADS (Subject Upload & Wipe DB)
     with t2:
         up_sub = st.file_uploader("Subjects CSV")
         if st.button("Upload") and up_sub: upload_to_firestore('setup_subjects', pd.read_csv(up_sub)); st.success("Done")
-        if st.button("Wipe DB"): delete_collection(db.collection('setup_subjects'), 50); st.success("Wiped")
+        
+        st.divider()
+        with st.expander("⚠️ Danger Zone"):
+            if st.button("🗑️ Wipe DB"): 
+                delete_collection(db.collection('setup_subjects'), 50)
+                delete_collection(db.collection('setup_students'), 50)
+                st.success("Wiped")
+
+    # 3. MANAGE (Search & Update Status) - RESTORED
     with t3:
-        if st.button("Download All"):
-            data = [d.to_dict() for d in db.collection('attendance_records').stream()] # Admin only - no cache
-            st.download_button("CSV", pd.DataFrame(data).to_csv().encode('utf-8'), "dump.csv")
+        q = st.text_input("Search USN").strip().upper()
+        if q:
+            doc = db.collection('setup_students').document(q).get()
+            if doc.exists:
+                d = doc.to_dict()
+                st.write(f"**{d.get('Name')}** | Status: **{d.get('Status')}**")
+                ns = st.selectbox("Status", ["Active", "Detained"])
+                if st.button("Update"): 
+                    update_student_status(q, ns)
+                    st.success("Updated")
+            else: st.warning("Not Found")
 
 def main():
     st.sidebar.title("RMS v6.3")
