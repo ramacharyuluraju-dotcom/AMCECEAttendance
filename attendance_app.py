@@ -318,6 +318,7 @@ def render_faculty_dashboard():
             if up_cp:
                 try:
                     df_up = pd.read_csv(up_cp).fillna(0)
+                    # Simplified mapping logic for upload
                     safe_write(save_copo_mapping, cur_code, df_up.to_dict('list'))
                     st.success("Uploaded!"); st.rerun()
                 except: st.error("Invalid CSV")
