@@ -44,31 +44,31 @@ def get_all_faculty_names():
 def get_subjects_for_faculty(faculty_name):
     if not faculty_name: return pd.DataFrame()
     try:
-        # Standard query - passing field name as direct string
-        # If this fails, the fallback below catches it
-        docs = db.collection('setup_subjects').where('Faculty Name', '==', faculty_name.strip()).stream()
-        data = [d.to_dict() for d in docs]
-        df = pd.DataFrame(data)
-        if not df.empty:
-            df['Display_Label'] = df['Section'].astype(str).str.upper() + " - " + df['Subject Name']
-        return df
-    except Exception:
-        # Robust Fallback: Fetch all and filter in Python
-        # This guarantees it works even if Firestore query parser is strict
+        # Fallback: Fetch all and filter in Python (1 read per doc, but safe)
         all_docs = db.collection('setup_subjects').stream()
         data = [d.to_dict() for d in all_docs if d.to_dict().get('Faculty Name') == faculty_name.strip()]
         df = pd.DataFrame(data)
         if not df.empty:
             df['Display_Label'] = df['Section'].astype(str).str.upper() + " - " + df['Subject Name']
         return df
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600) # Cache Student List
 def get_active_students_in_section(section):
     section = str(section).strip().upper()
     try:
+        # Standard query attempt
         docs = db.collection('setup_students').where('Section', '==', section).stream()
         data = [d.to_dict() for d in docs]
+        
+        # Fallback if query returns nothing due to field issues
+        if not data:
+             docs = db.collection('setup_students').stream()
+             data = [d.to_dict() for d in docs if str(d.to_dict().get('Section')).upper() == section]
+
         if not data: return pd.DataFrame(columns=['USN', 'Name'])
+        
         df = pd.DataFrame(data)
         if 'Status' in df.columns:
             df = df[df['Status'] == 'Active']
