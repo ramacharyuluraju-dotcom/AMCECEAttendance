@@ -44,7 +44,8 @@ def get_all_faculty_names():
 def get_subjects_for_faculty(faculty_name):
     if not faculty_name: return pd.DataFrame()
     try:
-        # Standard query - Firestore handles spaces in strings fine usually
+        # Standard query - passing field name as direct string
+        # If this fails, the fallback below catches it
         docs = db.collection('setup_subjects').where('Faculty Name', '==', faculty_name.strip()).stream()
         data = [d.to_dict() for d in docs]
         df = pd.DataFrame(data)
@@ -52,7 +53,8 @@ def get_subjects_for_faculty(faculty_name):
             df['Display_Label'] = df['Section'].astype(str).str.upper() + " - " + df['Subject Name']
         return df
     except Exception:
-        # Fallback: Fetch all and filter in Python (1 read per doc, but safe)
+        # Robust Fallback: Fetch all and filter in Python
+        # This guarantees it works even if Firestore query parser is strict
         all_docs = db.collection('setup_subjects').stream()
         data = [d.to_dict() for d in all_docs if d.to_dict().get('Faculty Name') == faculty_name.strip()]
         df = pd.DataFrame(data)
@@ -220,10 +222,12 @@ def calculate_attainment(subject_code):
             perc = (passed/total*100) if total else 0
             co_res[co] = 3 if perc>=70 else 2 if perc>=60 else 1 if perc>=50 else 0
 
-        copo = fetch_copo_mapping(subject_code)
+        # Note: fetch_copo_mapping for calc is not cached to ensure fresh data
+        copo_matrix = db.collection('co_po_mappings').document(subject_code).get().to_dict()['mapping'] if db.collection('co_po_mappings').document(subject_code).get().exists else None
+        
         po_res = {}
-        if copo:
-            for po, vals in copo.items():
+        if copo_matrix:
+            for po, vals in copo_matrix.items():
                 if po=="CO_ID": continue
                 w_sum=0; count=0
                 for i, v in enumerate(vals):
@@ -320,16 +324,33 @@ def render_faculty_dashboard():
                     df_up = pd.read_csv(up_cp).fillna(0)
                     # Simplified mapping logic for upload
                     safe_write(save_copo_mapping, cur_code, df_up.to_dict('list'))
+                    st.session_state.pop(f"copo_data_{cur_code}", None) # Clear session state to reload
                     st.success("Uploaded!"); st.rerun()
                 except: st.error("Invalid CSV")
         
-        # Grid
+        # Grid - FIX: Use Session State to prevent reset/dance
         cols = [f"PO{i}" for i in range(1,13)]+["PSO1","PSO2"]; rows = [f"CO{i}" for i in range(1,7)]
-        ex_map = fetch_copo_mapping(cur_code)
-        df_cp = pd.DataFrame(ex_map) if ex_map else pd.DataFrame(0, index=rows, columns=cols)
-        if not ex_map: df_cp.insert(0, "CO_ID", rows)
-        edt_cp = st.data_editor(df_cp, hide_index=True)
-        if st.button("Save Mapping"): safe_write(save_copo_mapping, cur_code, edt_cp.to_dict('list')); st.success("Saved")
+        
+        # Key for this specific subject's CO-PO data
+        copo_key = f"copo_data_{cur_code}"
+        
+        if copo_key not in st.session_state:
+            ex_map = fetch_copo_mapping(cur_code)
+            if ex_map:
+                st.session_state[copo_key] = pd.DataFrame(ex_map)
+            else:
+                df_cp = pd.DataFrame(0, index=rows, columns=cols)
+                df_cp.insert(0, "CO_ID", rows)
+                st.session_state[copo_key] = df_cp
+                
+        # Use session state dataframe in editor
+        edt_cp = st.data_editor(st.session_state[copo_key], hide_index=True, key=f"editor_{copo_key}")
+        
+        if st.button("Save Mapping"): 
+            safe_write(save_copo_mapping, cur_code, edt_cp.to_dict('list'))
+            # Update session state with the edited version so it stays consistent
+            st.session_state[copo_key] = edt_cp
+            st.success("Saved")
 
     with t5:
         if st.button("Generate Report"):
