@@ -6,19 +6,16 @@ import json
 from datetime import datetime
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Attendance System", layout="centered", page_icon="📝")
+st.set_page_config(page_title="Attendance System", layout="wide", page_icon="📝")
 
-# --- FIREBASE CONNECTION (Robust Fix) ---
+# --- FIREBASE CONNECTION ---
 @st.cache_resource
 def get_db():
     if not firebase_admin._apps:
         try:
-            # 1. Check if 'textkey' exists in secrets
             if "textkey" in st.secrets:
                 secret_val = st.secrets["textkey"]
-                
-                # 2. robust handling: If it's a string (from the foolproof method), parse it.
-                # If it's already a dict (from standard toml), use it as is.
+                # Handle both string (foolproof) and dict formats
                 if isinstance(secret_val, str):
                     key_dict = json.loads(secret_val)
                 else:
@@ -27,7 +24,7 @@ def get_db():
                 cred = credentials.Certificate(key_dict)
                 firebase_admin.initialize_app(cred)
             else:
-                st.error("Error: 'textkey' missing in .streamlit/secrets.toml")
+                st.error("Error: 'textkey' missing in secrets.toml")
                 st.stop()
         except Exception as e:
             st.error(f"Firebase Connection Error: {e}")
@@ -40,7 +37,6 @@ db = get_db()
 
 def check_login(username, password, role):
     try:
-        # Get passwords from secrets, defaulting to simple ones if missing
         admin_pass = st.secrets.get("general", {}).get("admin_password", "admin123")
         fac_pass = st.secrets.get("general", {}).get("faculty_password", "1234")
         
@@ -85,7 +81,6 @@ def get_subjects_for_faculty(faculty_name):
 def get_active_students_in_section(section):
     section = str(section).strip().upper()
     try:
-        # Fetch all students and filter in python to avoid index issues
         docs = db.collection('setup_students').stream()
         data = [d.to_dict() for d in docs if str(d.to_dict().get('Section')).upper() == section]
         
@@ -97,6 +92,20 @@ def get_active_students_in_section(section):
         return df[['USN', 'Name']].sort_values('USN')
     except:
         return pd.DataFrame(columns=['USN', 'Name'])
+
+# --- NEW: ANALYTICS FETCH FUNCTION ---
+@st.cache_data(ttl=10)
+def fetch_attendance_history(section, subject_code):
+    """Fetches all attendance records for a specific class to calculate stats."""
+    try:
+        # Note: Ideally requires a composite index in Firebase, but works for small datasets without it
+        docs = db.collection('attendance_records')\
+                 .where('Section', '==', section)\
+                 .where('Code', '==', subject_code)\
+                 .stream()
+        return [d.to_dict() for d in docs]
+    except Exception as e:
+        return []
 
 # ============================= WRITE FUNCTIONS =============================
 
@@ -112,6 +121,8 @@ def save_attendance_record(records):
             batch = db.batch()
             count = 0
     if count > 0: batch.commit()
+    # Clear cache so analytics update immediately
+    fetch_attendance_history.clear()
 
 # ============================= ADMIN FUNCTIONS =============================
 
@@ -161,40 +172,138 @@ def login_screen():
 
 def render_attendance_interface(user_name):
     st.subheader(f"👋 Welcome, {user_name}")
-    df_subs = get_subjects_for_faculty(user_name)
     
+    # 1. CLASS SELECTION
+    df_subs = get_subjects_for_faculty(user_name)
     if df_subs.empty:
-        st.warning("No subjects assigned to you.")
+        st.warning("No subjects assigned.")
         return
 
-    sel_cls = st.selectbox("Select Class", df_subs['Display_Label'].unique())
+    c_sel1, c_sel2 = st.columns([3, 1])
+    sel_cls = c_sel1.selectbox("Select Class", df_subs['Display_Label'].unique())
+    
     cls_info = df_subs[df_subs['Display_Label'] == sel_cls].iloc[0]
-    
-    c1, c2 = st.columns(2)
-    d_val = c1.date_input("Date", datetime.now())
-    t_slot = c2.selectbox("Time Slot", ["09:00-10:00", "10:00-11:00", "11:15-12:15", "01:00-02:00", "02:00-03:00", "03:00-04:00"])
+    curr_sec = cls_info['Section'].upper()
+    curr_code = cls_info['Subject Code']
+    curr_sub = cls_info['Subject Name']
 
-    df_students = get_active_students_in_section(cls_info['Section'].upper())
-    
-    if not df_students.empty:
-        att_df = df_students.copy()
-        att_df['Present'] = True
-        edited_df = st.data_editor(att_df, column_config={"Present": st.column_config.CheckboxColumn(default=True)}, disabled=["USN","Name"], hide_index=True, use_container_width=True, height=400)
+    # --- TABS FOR FEATURES ---
+    tab1, tab2, tab3 = st.tabs(["📝 Mark Attendance", "📊 Analytics & Report", "📅 History Log"])
 
-        if st.button("💾 Submit Attendance", type="primary", use_container_width=True):
-            recs = []
-            for _, row in edited_df.iterrows():
-                recs.append({
-                    "Date": str(d_val), "Time": t_slot, "Faculty": user_name,
-                    "Section": cls_info['Section'].upper(), "Code": cls_info['Subject Code'],
-                    "Subject": cls_info['Subject Name'], "USN": row['USN'],
-                    "Name": row['Name'], "Status": "Present" if row['Present'] else "Absent",
-                    "Timestamp": datetime.now().isoformat()
-                })
-            save_attendance_record(recs)
-            st.success("Attendance Saved!")
-    else:
-        st.error("No students found.")
+    # --- TAB 1: MARK ATTENDANCE ---
+    with tab1:
+        c1, c2 = st.columns(2)
+        d_val = c1.date_input("Date", datetime.now())
+        t_slot = c2.selectbox("Time Slot", ["09:00-10:00", "10:00-11:00", "11:15-12:15", "01:00-02:00", "02:00-03:00", "03:00-04:00"])
+
+        df_students = get_active_students_in_section(curr_sec)
+        
+        if not df_students.empty:
+            att_df = df_students.copy()
+            att_df['Present'] = True
+            
+            # Form wrapper to prevent accidental reloads
+            with st.form("attendance_form"):
+                edited_df = st.data_editor(
+                    att_df, 
+                    column_config={"Present": st.column_config.CheckboxColumn(default=True)}, 
+                    disabled=["USN","Name"], 
+                    hide_index=True, 
+                    use_container_width=True, 
+                    height=400
+                )
+                submit_btn = st.form_submit_button("💾 Submit Attendance", type="primary")
+
+            if submit_btn:
+                recs = []
+                for _, row in edited_df.iterrows():
+                    recs.append({
+                        "Date": str(d_val), "Time": t_slot, "Faculty": user_name,
+                        "Section": curr_sec, "Code": curr_code,
+                        "Subject": curr_sub, "USN": row['USN'],
+                        "Name": row['Name'], "Status": "Present" if row['Present'] else "Absent",
+                        "Timestamp": datetime.now().isoformat()
+                    })
+                save_attendance_record(recs)
+                st.success("Attendance Saved Successfully!")
+        else:
+            st.error("No students found in this section.")
+
+    # --- TAB 2: ANALYTICS (The "Grok" Features) ---
+    with tab2:
+        st.markdown(f"**Attendance Summary: {curr_sub} ({curr_sec})**")
+        
+        # 1. Fetch Data
+        history_data = fetch_attendance_history(curr_sec, curr_code)
+        
+        if history_data:
+            df_hist = pd.DataFrame(history_data)
+            
+            # 2. Process Statistics
+            total_classes = df_hist['Date'].nunique() # Count unique dates (or date+time combinations)
+            
+            # Group by USN to count "Present"
+            # Filter only where Status == Present
+            present_counts = df_hist[df_hist['Status'] == 'Present'].groupby('USN').size()
+            
+            # Get list of all students (even those with 0 attendance)
+            all_students = get_active_students_in_section(curr_sec)
+            
+            if not all_students.empty:
+                report_data = []
+                for _, stu in all_students.iterrows():
+                    p_count = present_counts.get(stu['USN'], 0)
+                    percentage = (p_count / total_classes * 100) if total_classes > 0 else 0
+                    report_data.append({
+                        "USN": stu['USN'],
+                        "Name": stu['Name'],
+                        "Total Classes": total_classes,
+                        "Attended": p_count,
+                        "Percentage": round(percentage, 1)
+                    })
+                
+                df_report = pd.DataFrame(report_data)
+
+                # 3. Highlighting Logic (Red if < 75%)
+                def highlight_low_attendance(val):
+                    color = '#ffcccc' if val < 75 else '#ccffcc'
+                    return f'background-color: {color}'
+
+                st.dataframe(
+                    df_report.style.applymap(highlight_low_attendance, subset=['Percentage']),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Download Button
+                st.download_button(
+                    "📥 Download Report (CSV)",
+                    df_report.to_csv(index=False),
+                    f"Attendance_{curr_sec}_{curr_code}.csv",
+                    "text/csv"
+                )
+            else:
+                st.info("No active students.")
+        else:
+            st.info("No attendance records found yet.")
+
+    # --- TAB 3: HISTORY LOG ---
+    with tab3:
+        # Simple date filter
+        hist_date = st.date_input("Filter by Date", key="hist_date")
+        history_data = fetch_attendance_history(curr_sec, curr_code)
+        
+        if history_data:
+            df_hist = pd.DataFrame(history_data)
+            # Filter by selected date
+            df_day = df_hist[df_hist['Date'] == str(hist_date)]
+            
+            if not df_day.empty:
+                st.write(f"Records for {hist_date}: {len(df_day)} entries")
+                # Pivot for cleaner view if multiple slots exist
+                st.dataframe(df_day[['Time', 'USN', 'Name', 'Status']], hide_index=True, use_container_width=True)
+            else:
+                st.warning(f"No classes recorded on {hist_date}")
 
 def render_admin_panel():
     st.subheader("🛠️ Admin Panel")
