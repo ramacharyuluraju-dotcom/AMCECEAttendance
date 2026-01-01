@@ -2,365 +2,272 @@ import streamlit as st
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
+from google.cloud.firestore_v1.base_query import FieldFilter
 import datetime
-import time
 
 # ==========================================
-# 1. SETUP & AUTHENTICATION
+# 1. CONFIGURATION
 # ==========================================
 
-st.set_page_config(page_title="VTU Attendance System", layout="wide")
+st.set_page_config(page_title="VTU Attendance Visualizer", layout="wide")
 
-# Initialize Firebase
 if not firebase_admin._apps:
     try:
-        # CLOUD: Try loading from Secrets
         key_dict = dict(st.secrets["firebase"])
         cred = credentials.Certificate(key_dict)
     except Exception:
-        # LOCAL: Fallback to file
         cred = credentials.Certificate("firebase_key.json")
         
-    # REPLACE with your bucket name
     BUCKET_NAME = "your-project-id.appspot.com" 
-    
-    firebase_admin.initialize_app(cred, {
-        'storageBucket': BUCKET_NAME
-    })
+    firebase_admin.initialize_app(cred, {'storageBucket': BUCKET_NAME})
 
 db = firestore.client()
-bucket = storage.bucket()
 
-# Initialize Session State
 if 'user' not in st.session_state:
     st.session_state['user'] = None
-if 'role' not in st.session_state:
-    st.session_state['role'] = None
 
 # ==========================================
-# 2. HELPER FUNCTIONS
+# 2. LOGIN LOGIC
 # ==========================================
 
-def login(username, password):
-    """Simple Auth System"""
-    # 1. Hardcoded Admin
-    if username == "admin" and password == "admin123":
-        return {"name": "Administrator", "role": "Admin", "id": "admin"}
+def login_user(uid, pwd):
+    if uid == "admin" and pwd == "admin123":
+        return {"id": "admin", "name": "Administrator", "role": "Admin"}
     
-    # 2. Check Firestore Users (Faculty/Students)
-    # Users collection structure: { "password": "...", "role": "Faculty", "name": "..." }
-    doc = db.collection('Users').document(username).get()
+    doc = db.collection('Users').document(uid).get()
     if doc.exists:
-        user_data = doc.to_dict()
-        if user_data.get('password') == password:
-            user_data['id'] = username
-            return user_data
+        data = doc.to_dict()
+        if data.get('password') == pwd:
+            data['id'] = uid
+            return data
     return None
 
-def batch_write_courses(df):
-    """Part A: Upload Courses & Create Faculty Logins"""
-    batch = db.batch()
-    count = 0
+# ==========================================
+# 3. STUDENT DASHBOARD (VISUAL ONLY)
+# ==========================================
+
+def student_visual_dashboard(user_data):
+    st.header(f"📊 My Attendance Graph")
+    usn = user_data['id']
     
-    for index, row in df.iterrows():
-        # 1. Create Course Document
-        # ID format: AY_Dept_Sem_Sec_SubCode (e.g., 2023_CS_5_A_18CS51)
-        course_id = f"{row['AY']}_{row['Dept']}_{row['Sem']}_{row['Section']}_{row['SubCode']}"
-        course_ref = db.collection('Courses').document(course_id)
-        
-        course_data = {
-            "ay": str(row['AY']),
-            "dept": row['Dept'],
-            "sem": str(row['Sem']),
-            "section": row['Section'],
-            "subcode": row['SubCode'],
-            "subtitle": row['SubTitle'],
-            "faculty_id": row['FacultyEmail'], # Link to faculty
-            "faculty_name": row['FacultyName']
-        }
-        batch.set(course_ref, course_data)
-        
-        # 2. Create Faculty Login (if not exists)
-        user_ref = db.collection('Users').document(row['FacultyEmail'])
-        if not user_ref.get().exists:
-            batch.set(user_ref, {
-                "name": row['FacultyName'],
-                "password": "password123", # Default Password
-                "role": "Faculty",
-                "dept": row['Dept']
-            })
-        
-        count += 1
-        if count % 400 == 0: # Firestore batch limit is 500
-            batch.commit()
-            batch = db.batch()
+    # 1. Fetch Summary Data
+    doc = db.collection('Student_Summaries').document(usn).get()
+    
+    if not doc.exists:
+        st.info("No attendance data available to visualize.")
+        return
+
+    data = doc.to_dict()
+    chart_data = []
+    
+    # 2. Process Data for Graph
+    for subject_code, stats in data.items():
+        if isinstance(stats, dict) and 'total' in stats:
+            total = stats['total']
+            attended = stats.get('attended', 0)
+            pct = (attended / total * 100) if total > 0 else 0
             
-    batch.commit()
-    return count
-
-def batch_write_students(df):
-    """Part B: Upload Student List"""
-    batch = db.batch()
-    count = 0
-    
-    for index, row in df.iterrows():
-        usn = str(row['USN']).upper().strip()
-        student_ref = db.collection('Students').document(usn)
-        
-        student_data = {
-            "name": row['Name'],
-            "dept": row['Dept'],
-            "sem": str(row['Sem']),
-            "section": row['Section'],
-            "email": row.get('Email', f"{usn}@college.edu")
-        }
-        batch.set(student_ref, student_data)
-        
-        # Create Student Login
-        user_ref = db.collection('Users').document(usn)
-        if not user_ref.get().exists:
-            batch.set(user_ref, {
-                "name": row['Name'],
-                "password": usn, # Default pass is USN
-                "role": "Student"
-            })
-
-        count += 1
-        if count % 400 == 0:
-            batch.commit()
-            batch = db.batch()
+            # Color Logic (VTU Rules)
+            # We can't color bars individually easily in simple st.bar_chart, 
+            # so we prepare a dataframe for a custom chart or simple display.
+            status = "Safe" if pct >= 85 else ("Warning" if pct >= 75 else "Critical")
             
-    batch.commit()
-    return count
-
-# ==========================================
-# 3. ADMIN VIEW
-# ==========================================
-
-def admin_view():
-    st.title("Admin Control Center")
+            chart_data.append({
+                "Subject": subject_code,
+                "Attendance %": round(pct, 1),
+                "Status": status,
+                "Attended": attended,
+                "Total": total
+            })
     
-    tab1, tab2, tab3 = st.tabs(["Part A: Course & Faculty", "Part B: Student Bulk Load", "Modify Data"])
-    
-    # --- PART A: LOAD ACADEMICS ---
-    with tab1:
-        st.subheader("📁 Upload Course Allocation (Part A)")
-        st.info("CSV Columns Required: AY, Dept, Sem, Section, SubCode, SubTitle, FacultyName, FacultyEmail")
+    if chart_data:
+        df = pd.DataFrame(chart_data)
         
-        uploaded_file = st.file_uploader("Upload Courses CSV", type=['csv'], key="part_a")
-        if uploaded_file:
-            df = pd.read_csv(uploaded_file)
-            st.dataframe(df.head())
-            if st.button("Process Part A"):
-                with st.spinner("Creating Courses & Faculty Logins..."):
-                    count = batch_write_courses(df)
-                st.success(f"Successfully processed {count} records!")
-
-    # --- PART B: LOAD STUDENTS ---
-    with tab2:
-        st.subheader("👨‍🎓 Upload Student List (Part B)")
-        st.info("CSV Columns Required: USN, Name, Dept, Sem, Section")
+        # 3. Display Metric Cards (Top Row)
+        col1, col2, col3 = st.columns(3)
+        avg_att = df["Attendance %"].mean()
+        col1.metric("Average Attendance", f"{avg_att:.1f}%")
+        col2.metric("Safe Subjects", len(df[df['Status'] == 'Safe']))
+        col3.metric("Critical Subjects", len(df[df['Status'] == 'Critical']), delta_color="inverse")
         
-        uploaded_file_b = st.file_uploader("Upload Students CSV", type=['csv'], key="part_b")
-        if uploaded_file_b:
-            df_b = pd.read_csv(uploaded_file_b)
-            st.dataframe(df_b.head())
-            if st.button("Process Part B"):
-                with st.spinner("Registering Students..."):
-                    count = batch_write_students(df_b)
-                st.success(f"Successfully registered {count} students!")
-
-    # --- MODIFY DATA ---
-    with tab3:
-        st.subheader("✏️ Modify Records")
-        edit_type = st.radio("What to edit?", ["Student", "Course/Faculty"])
+        st.divider()
         
-        if edit_type == "Student":
-            search_usn = st.text_input("Enter USN to Edit").upper()
-            if search_usn and st.button("Search Student"):
-                doc_ref = db.collection('Students').document(search_usn)
-                doc = doc_ref.get()
-                if doc.exists:
-                    data = doc.to_dict()
-                    with st.form("edit_student"):
-                        new_name = st.text_input("Name", data.get('name'))
-                        new_sec = st.text_input("Section", data.get('section'))
-                        if st.form_submit_button("Update Student"):
-                            doc_ref.update({"name": new_name, "section": new_sec})
-                            st.success("Updated!")
-                else:
-                    st.error("Student not found.")
-                    
-        elif edit_type == "Course/Faculty":
-            # Simple manual fetch for now
-            search_code = st.text_input("Enter SubCode (e.g., 18CS51)")
-            if search_code and st.button("Find Courses"):
-                docs = db.collection('Courses').where("subcode", "==", search_code).stream()
-                for doc in docs:
-                    d = doc.to_dict()
-                    st.write(f"Found: {d['ay']} - {d['section']} - {d['faculty_name']}")
-                    if st.button(f"Delete {doc.id}", key=doc.id):
-                        db.collection('Courses').document(doc.id).delete()
-                        st.warning("Deleted. Refresh to see changes.")
+        # 4. Main Bar Chart
+        st.subheader("Subject-wise Performance")
+        # Using Streamlit's native simple bar chart
+        st.bar_chart(df, x="Subject", y="Attendance %", color="#4F8BF9")
+        
+        # 5. Data Table (Optional, for detail)
+        with st.expander("View Detailed Numbers"):
+            st.dataframe(df.style.highlight_between(left=0, right=74.9, subset="Attendance %", color="#ffcccc"))
+    else:
+        st.warning("No subject data found.")
 
 # ==========================================
-# 4. FACULTY VIEW (Dynamic)
+# 4. FACULTY DASHBOARD (EDITABLE NAME)
 # ==========================================
 
-def faculty_view(user_email):
-    st.header(f"👨‍🏫 Welcome, {st.session_state['user']['name']}")
+def faculty_marking_dashboard(user_data):
+    st.header("📝 Mark Attendance")
     
     # 1. Fetch Assigned Courses
-    courses_ref = db.collection('Courses').where("faculty_id", "==", user_email).stream()
-    my_courses = [doc.to_dict() for doc in courses_ref]
+    courses = list(db.collection('Courses').where(filter=FieldFilter("faculty_id", "==", user_data['id'])).stream())
     
-    if not my_courses:
-        st.warning("No courses assigned to you in the database.")
+    if not courses:
+        st.warning("No courses assigned.")
         return
-
-    # 2. Select Course
-    course_options = {f"{c['subcode']} ({c['section']})": c for c in my_courses}
-    selected_label = st.selectbox("Select Class", list(course_options.keys()))
-    selected_course = course_options[selected_label]
+        
+    c_options = {f"{c.to_dict()['subcode']} ({c.to_dict()['section']})": c.to_dict() for c in courses}
+    selected_name = st.selectbox("Select Class", list(c_options.keys()))
+    course_data = c_options[selected_name]
     
-    st.info(f"Marking Attendance for: {selected_course['subtitle']} - Sec {selected_course['section']}")
+    st.divider()
     
-    date_sel = st.date_input("Date", datetime.date.today())
-    
-    # 3. Fetch Students for this Section
+    # 2. Fetch Students (Mapped by Dept+Sem+Section)
     students_ref = db.collection('Students')\
-        .where("dept", "==", selected_course['dept'])\
-        .where("sem", "==", selected_course['sem'])\
-        .where("section", "==", selected_course['section'])\
+        .where(filter=FieldFilter("dept", "==", course_data['dept']))\
+        .where(filter=FieldFilter("sem", "==", course_data['sem']))\
+        .where(filter=FieldFilter("section", "==", course_data['section']))\
         .stream()
         
-    student_list = [{"usn": doc.id, "name": doc.to_dict()['name']} for doc in students_ref]
-    student_list.sort(key=lambda x: x['usn']) # Sort by USN
+    students = sorted([{"usn": doc.id, "name": doc.to_dict()['name']} for doc in students_ref], key=lambda x: x['usn'])
     
-    if not student_list:
-        st.error("No students found for this class section. Please ask Admin to upload Part B.")
+    if not students:
+        st.error(f"No students found in {course_data['dept']} Sem {course_data['sem']} Sec {course_data['section']}")
         return
 
-    # 4. Marking Interface
-    with st.form("att_form"):
-        status = {}
+    # 3. Marking Form
+    with st.form("mark_attendance"):
+        c1, c2 = st.columns(2)
+        date_val = c1.date_input("Date", datetime.date.today())
+        
+        # --- CRITICAL REQUIREMENT: EDITABLE FACULTY NAME ---
+        # Prefilled with login name, but editable for substitutes
+        faculty_name = c2.text_input("Faculty Taking Class", value=user_data['name'])
+        
+        st.markdown("### Student List")
+        attendance_map = {}
+        
+        # Grid Layout
         cols = st.columns(3)
-        for i, stu in enumerate(student_list):
+        for i, student in enumerate(students):
             col = cols[i % 3]
-            # Default True (Present)
-            status[stu['usn']] = col.checkbox(f"{stu['usn']}", value=True)
+            attendance_map[student['usn']] = col.checkbox(f"{student['usn']}", value=True)
             
-        if st.form_submit_button("Submit Attendance"):
-            absentees = [usn for usn, present in status.items() if not present]
+        if st.form_submit_button("Save Attendance Record"):
+            absentees = [usn for usn, present in attendance_map.items() if not present]
             
-            # Batch Write Logic
             batch = db.batch()
             
-            # A. Session Log
-            sess_ref = db.collection('Class_Sessions').document()
-            batch.set(sess_ref, {
-                "date": str(date_sel),
-                "course_code": selected_course['subcode'],
-                "section": selected_course['section'],
+            # A. Save Session (With Editable Faculty Name)
+            session_ref = db.collection('Class_Sessions').document()
+            batch.set(session_ref, {
+                "course_code": course_data['subcode'],
+                "section": course_data['section'],
+                "date": str(date_val),
+                "faculty_name": faculty_name, # <--- SAVES THE EDITED NAME
+                "faculty_id_logged_in": user_data['id'], # Audit trail
                 "absentees": absentees,
                 "timestamp": datetime.datetime.now()
             })
             
-            # B. Student Summaries
-            course_key = selected_course['subcode'] # e.g., 18CS51
-            for stu in student_list:
-                usn = stu['usn']
-                summ_ref = db.collection('Student_Summaries').document(usn)
+            # B. Update Aggregates
+            for s in students:
+                summ_ref = db.collection('Student_Summaries').document(s['usn'])
+                key = course_data['subcode']
                 
-                upd = {
-                    f"{course_key}.total": firestore.Increment(1),
-                    f"{course_key}.title": selected_course['subtitle']
+                updates = {
+                    f"{key}.total": firestore.Increment(1),
+                    f"{key}.title": course_data['subtitle']
                 }
-                if usn not in absentees:
-                    upd[f"{course_key}.attended"] = firestore.Increment(1)
-                
-                batch.set(summ_ref, upd, merge=True)
+                if s['usn'] not in absentees:
+                    updates[f"{key}.attended"] = firestore.Increment(1)
+                    
+                batch.set(summ_ref, updates, merge=True)
                 
             batch.commit()
-            st.success("Attendance Recorded Successfully!")
+            st.success(f"Attendance marked by {faculty_name} for {len(students)} students!")
 
 # ==========================================
-# 5. STUDENT VIEW (Read Only)
+# 5. ADMIN DASHBOARD (Simplified)
 # ==========================================
 
-def student_view(usn):
-    st.header(f"🎓 Student Dashboard: {usn}")
+def admin_dashboard():
+    st.title("Admin Console")
     
-    doc = db.collection('Student_Summaries').document(usn).get()
-    
-    if doc.exists:
-        data = doc.to_dict()
-        st.subheader("Attendance Report")
+    # Simple CSV Upload for "Part A" (Courses)
+    uploaded_file = st.file_uploader("Upload Courses CSV (AY, Dept, Sem, Sec, SubCode, Title, FacName, FacEmail)")
+    if uploaded_file and st.button("Process Courses"):
+        df = pd.read_csv(uploaded_file)
+        batch = db.batch()
+        for _, row in df.iterrows():
+            cid = f"{row['Dept']}_{row['Sem']}_{row['Section']}_{row['SubCode']}"
+            ref = db.collection('Courses').document(cid)
+            batch.set(ref, {
+                "dept": row['Dept'], "sem": str(row['Sem']), "section": row['Section'],
+                "subcode": row['SubCode'], "subtitle": row['SubTitle'],
+                "faculty_id": row['FacultyEmail'], "faculty_name": row['FacultyName']
+            })
+            # Create Faculty Login
+            u_ref = db.collection('Users').document(row['FacultyEmail'])
+            if not u_ref.get().exists:
+                batch.set(u_ref, {"name": row['FacultyName'], "password": "password123", "role": "Faculty"})
+        batch.commit()
+        st.success("Courses and Faculty Logins created.")
         
-        for code, info in data.items():
-            if isinstance(info, dict) and 'total' in info:
-                total = info['total']
-                attended = info.get('attended', 0)
-                pct = (attended / total * 100) if total > 0 else 0
-                
-                # VTU Logic (85% Green, 75% Orange, <75% Red)
-                if pct >= 85:
-                    color = "green"
-                elif pct >= 75:
-                    color = "orange"
-                else:
-                    color = "red"
-                    
-                st.markdown(f"**{info.get('title', code)}**")
-                st.markdown(f":{color}[{pct:.1f}%] ({attended}/{total})")
-                st.progress(pct / 100)
-                st.divider()
-    else:
-        st.info("No attendance data found.")
+    # Simple CSV Upload for "Part B" (Students)
+    st.divider()
+    s_file = st.file_uploader("Upload Students CSV (USN, Name, Dept, Sem, Section)")
+    if s_file and st.button("Process Students"):
+        df = pd.read_csv(s_file)
+        batch = db.batch()
+        for _, row in df.iterrows():
+            usn = str(row['USN']).upper().strip()
+            # Profile
+            batch.set(db.collection('Students').document(usn), {
+                "name": row['Name'], "dept": row['Dept'], 
+                "sem": str(row['Sem']), "section": row['Section']
+            })
+            # Login
+            u_ref = db.collection('Users').document(usn)
+            if not u_ref.get().exists:
+                batch.set(u_ref, {"name": row['Name'], "password": usn, "role": "Student"})
+        batch.commit()
+        st.success("Students registered.")
 
 # ==========================================
-# 6. LOGIN & MAIN FLOW
+# 6. MAIN APP
 # ==========================================
 
 def main():
-    # If not logged in, show Login Screen
     if st.session_state['user'] is None:
-        st.title("🔐 VTU System Login")
-        
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            username = st.text_input("User ID / Email")
-            password = st.text_input("Password", type="password")
-            
-            if st.button("Login"):
-                user = login(username, password)
+        c1, c2 = st.columns([1,2])
+        with c1:
+            st.title("🔐 Login")
+            uid = st.text_input("User ID")
+            pwd = st.text_input("Password", type="password")
+            if st.button("Sign In"):
+                user = login_user(uid.strip(), pwd.strip())
                 if user:
                     st.session_state['user'] = user
-                    st.session_state['role'] = user['role']
                     st.rerun()
                 else:
-                    st.error("Invalid Credentials")
-        
-        with col2:
-            st.info("Default Admin: admin / admin123")
-            
+                    st.error("Invalid credentials")
     else:
-        # LOGGED IN
         user = st.session_state['user']
         
-        # Sidebar
-        st.sidebar.write(f"Logged in as: **{user['name']}** ({user['role']})")
-        if st.sidebar.button("Logout"):
-            st.session_state['user'] = None
-            st.rerun()
-            
-        # Routing
+        with st.sidebar:
+            st.write(f"Logged in: **{user['name']}**")
+            if st.button("Logout"):
+                st.session_state['user'] = None
+                st.rerun()
+                
         if user['role'] == "Admin":
-            admin_view()
+            admin_dashboard()
         elif user['role'] == "Faculty":
-            faculty_view(user['id']) # Pass email
+            faculty_marking_dashboard(user)
         elif user['role'] == "Student":
-            student_view(user['id']) # Pass USN
+            student_visual_dashboard(user)
 
 if __name__ == "__main__":
     main()
