@@ -1,35 +1,25 @@
 import streamlit as st
-import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 import datetime
-import json
 
 # ==========================================
 # 1. SETUP & AUTHENTICATION
 # ==========================================
 
-st.set_page_config(page_title="VTU Attendance & Compliance", layout="wide")
+st.set_page_config(page_title="VTU Attendance (Reg 2022)", layout="wide")
 
-# Check if Firebase is already initialized to avoid "App already exists" error
 if not firebase_admin._apps:
-    # --------------------------------------------------------------------------
-    # AUTHENTICATION LOGIC (Cloud vs. Local)
-    # --------------------------------------------------------------------------
     try:
-        # CASE 1: STREAMLIT CLOUD
-        # We try to access the secrets. If this fails, we go to the 'except' block.
+        # CLOUD: Try loading from Secrets
         key_dict = dict(st.secrets["firebase"])
         cred = credentials.Certificate(key_dict)
     except Exception:
-        # CASE 2: LOCAL MACHINE
-        # If secrets aren't found, we look for the JSON file on your computer.
-        # Make sure 'firebase_key.json' is in the same folder as app.py
+        # LOCAL: Fallback to file
         cred = credentials.Certificate("firebase_key.json")
         
-    # REPLACE THIS with your actual bucket name from Firebase Console -> Storage
-    # It usually looks like: 'your-project-id.appspot.com'
+    # REPLACE with your bucket name
     BUCKET_NAME = "your-project-id.appspot.com" 
     
     firebase_admin.initialize_app(cred, {
@@ -44,7 +34,7 @@ bucket = storage.bucket()
 # ==========================================
 
 def get_roster(course_id):
-    """Mock roster for demonstration"""
+    """Mock roster"""
     return [
         {"usn": "1MV20CS001", "name": "Rahul Sharma"},
         {"usn": "1MV20CS002", "name": "Priya Gowda"},
@@ -54,21 +44,15 @@ def get_roster(course_id):
     ]
 
 def upload_to_bucket(file_obj, path):
-    """Uploads file to Firebase Storage and returns public URL"""
     blob = bucket.blob(path)
-    blob.upload_from_string(
-        file_obj.getvalue(), 
-        content_type=file_obj.type
-    )
-    # Note: makes file publicly accessible via URL
+    blob.upload_from_string(file_obj.getvalue(), content_type=file_obj.type)
     blob.make_public()
     return blob.public_url
 
 def batch_mark_attendance(course_id, date, total_students, absentees):
-    """Writes session log + Updates student summaries (Hybrid Approach)"""
     batch = db.batch()
     
-    # A. Create Session Log
+    # Log Session
     session_ref = db.collection('Class_Sessions').document()
     batch.set(session_ref, {
         "date": str(date),
@@ -77,19 +61,16 @@ def batch_mark_attendance(course_id, date, total_students, absentees):
         "timestamp": datetime.datetime.now()
     })
     
-    # B. Fan-out Update (Update individual student summaries)
+    # Update Student Summaries
     for student in total_students:
         usn = student['usn']
         is_absent = usn in absentees
-        
         summary_ref = db.collection('Student_Summaries').document(usn)
         
-        # Firestore Increment to avoid race conditions
         update_data = {
             f"{course_id}.total_classes": firestore.Increment(1),
             f"{course_id}.last_updated": datetime.datetime.now()
         }
-        
         if not is_absent:
             update_data[f"{course_id}.attended_classes"] = firestore.Increment(1)
             
@@ -98,11 +79,11 @@ def batch_mark_attendance(course_id, date, total_students, absentees):
     batch.commit()
 
 # ==========================================
-# 3. PAGE VIEWS
+# 3. FACULTY VIEW (Marking)
 # ==========================================
 
 def faculty_view():
-    st.header("👨‍🏫 Faculty Dashboard")
+    st.header("👨‍🏫 Faculty Dashboard (VTU Regs)")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -113,36 +94,37 @@ def faculty_view():
 
     st.divider()
     students = get_roster(course_id)
-    st.subheader(f"Marking Attendance for: {course}")
     
     with st.form("attendance_form"):
         attendance_status = {}
-        for student in students:
-            c1, c2 = st.columns([3, 1])
-            c1.write(f"**{student['usn']}** - {student['name']}")
-            # Default is Checked (Present)
-            attendance_status[student['usn']] = c2.checkbox("Present", value=True, key=student['usn'])
-            
-        submitted = st.form_submit_button("Submit Attendance")
+        st.write("Mark Absentees (Default is Present)")
         
-        if submitted:
+        # Grid Layout for faster marking
+        cols = st.columns(3)
+        for i, student in enumerate(students):
+            col = cols[i % 3]
+            attendance_status[student['usn']] = col.checkbox(f"{student['usn']}", value=True)
+            
+        if st.form_submit_button("Submit Attendance"):
             absent_list = [usn for usn, present in attendance_status.items() if not present]
-            with st.spinner("Syncing with Firestore..."):
+            with st.spinner("Syncing..."):
                 batch_mark_attendance(course_id, date_sel, students, absent_list)
-            st.success(f"✅ Attendance Saved! {len(absent_list)} students marked absent.")
+            st.success(f"Saved! {len(absent_list)} students marked absent.")
+
+# ==========================================
+# 4. STUDENT VIEW (Compliance Logic)
+# ==========================================
 
 def student_view():
-    st.header("🎓 Student Portal")
-    usn_input = st.text_input("Enter USN to view Dashboard", "1MV20CS001").strip().upper()
+    st.header("🎓 Student Compliance Portal")
+    usn_input = st.text_input("Enter USN", "1MV20CS001").strip().upper()
     
     if usn_input:
-        # Read from 'Student_Summaries' collection (Fast Read)
         doc = db.collection('Student_Summaries').document(usn_input).get()
         
         if doc.exists:
             data = doc.to_dict()
             st.divider()
-            st.subheader(f"Attendance Status: {usn_input}")
             
             for key, val in data.items():
                 if isinstance(val, dict) and "total_classes" in val:
@@ -151,37 +133,64 @@ def student_view():
                     attended = val.get('attended_classes', 0)
                     pct = (attended / total) * 100 if total > 0 else 0
                     
-                    st.write(f"**{course_code}**: {pct:.1f}% ({attended}/{total})")
-                    st.progress(pct / 100)
-        else:
-            st.info("No attendance records found yet.")
-
-        st.subheader("📤 Upload Certificates")
-        with st.expander("Submit Activity Point / Medical Cert"):
-            act_type = st.selectbox("Document Type", ["Activity Point", "Medical Certificate"])
-            uploaded_file = st.file_uploader("Choose PDF/Image", type=['pdf', 'png', 'jpg'])
-            
-            if uploaded_file and st.button("Upload Document"):
-                with st.spinner("Uploading..."):
-                    file_path = f"students/{usn_input}/{act_type}_{uploaded_file.name}"
-                    url = upload_to_bucket(uploaded_file, file_path)
+                    # VTU LOGIC: Clause 22OB 3.7
+                    # >= 85% : Safe
+                    # 75% - 85% : Condonation Required (Medical/Sports)
+                    # < 75% : DX Grade (Detained)
                     
-                    db.collection('Student_Documents').add({
-                        "usn": usn_input,
-                        "type": act_type,
-                        "url": url,
-                        "timestamp": datetime.datetime.now()
-                    })
-                    st.success("Uploaded successfully!")
+                    if pct >= 85:
+                        color = "green"
+                        status = "✅ Safe"
+                        buffer = int((attended - (0.85 * total)) / 0.85)
+                        msg = f"Buffer: Can miss {buffer} classes."
+                    elif 75 <= pct < 85:
+                        color = "orange"
+                        status = "⚠️ CONDONATION REQ"
+                        msg = "Submit Medical Cert immediately to Principal."
+                    else:
+                        color = "red"
+                        status = "🚫 DX GRADE RISK"
+                        needed = int(((0.85 * total) - attended) / 0.15)
+                        msg = f"CRITICAL: Attend next {needed} classes to reach 85%."
+                    
+                    st.markdown(f"### {course_code}: :{color}[{pct:.1f}%] - {status}")
+                    st.progress(pct / 100)
+                    st.caption(msg)
+                    
+                    # Condonation Upload Trigger
+                    if color == "orange" or color == "red":
+                        with st.expander(f"Upload Condonation Proof for {course_code}"):
+                            uploaded_file = st.file_uploader(f"Medical Cert ({course_code})", type=['pdf', 'jpg'], key=course_code)
+                            if uploaded_file and st.button("Submit to HOD", key=f"btn_{course_code}"):
+                                url = upload_to_bucket(uploaded_file, f"condonation/{usn_input}/{course_code}_{uploaded_file.name}")
+                                db.collection('Condonation_Requests').add({
+                                    "usn": usn_input, "course": course_code,
+                                    "url": url, "current_pct": pct,
+                                    "status": "Pending Principal Approval"
+                                })
+                                st.success("Request Sent!")
+                    st.divider()
+        else:
+            st.info("No records found.")
+
+        # Activity Points Section (Clause 22OB 6.9.1)
+        st.subheader("🏆 Activity Points (100 Pts Mandatory)")
+        with st.expander("Upload AICTE Activity Cert"):
+            act_file = st.file_uploader("Certificate", type=['pdf', 'jpg'])
+            if act_file and st.button("Upload Activity"):
+                url = upload_to_bucket(act_file, f"activity/{usn_input}/{act_file.name}")
+                db.collection('Activity_Points').add({
+                    "usn": usn_input, "url": url, "status": "Pending"
+                })
+                st.success("Activity recorded.")
 
 # ==========================================
-# 4. MAIN APP LOGIC
+# 5. MAIN
 # ==========================================
 
 def main():
-    st.sidebar.title("VTU Manager")
-    role = st.sidebar.radio("Select Role", ["Faculty", "Student"])
-    
+    st.sidebar.title("VTU Manager 2022")
+    role = st.sidebar.radio("Role", ["Faculty", "Student"])
     if role == "Faculty":
         faculty_view()
     else:
