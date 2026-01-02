@@ -28,19 +28,17 @@ if not firebase_admin._apps:
             cred = credentials.Certificate("firebase_key.json")
         firebase_admin.initialize_app(cred)
     except Exception as e:
-        # If app is already initialized, we pass
         pass
 
 db = firestore.client()
 
 # ==========================================
-# 2. CACHING & OPTIMIZATION (Saves $$$)
+# 2. CACHING & OPTIMIZATION
 # ==========================================
 
 @st.cache_data(ttl=3600)
 def get_students_cached(dept, sem, section):
-    """Fetches student list from DB (Cached for 1 hour to save reads)."""
-    # Note: We rely on the 'Students' collection for the list
+    """Fetches student list from DB."""
     docs = db.collection('Students')\
         .where("dept", "==", dept)\
         .where("sem", "==", sem)\
@@ -59,24 +57,14 @@ def get_faculty_courses(faculty_id):
 # ==========================================
 
 def sanitize_key(val):
-    """Ensures Keys (SubCode/USN) are Firestore-safe (No dots/slashes)."""
     if not val: return ""
-    # Replace dots and slashes with underscore to prevent nested object creation
     return str(val).strip().upper().replace(".", "_").replace("/", "_")
 
 def generate_email(name, existing_email=None):
-    """
-    Generates a valid email if missing.
-    Handles 'Dr.Aruna.R' -> 'dr.aruna.r@amc.edu'
-    """
     val = str(existing_email).strip().lower()
     if val and val not in ['nan', 'none', '']:
         return val
-    
-    # Generate from name
-    # Replace anything that isn't a letter/number with a dot
     clean_name = re.sub(r'[^a-zA-Z0-9]', '.', str(name).strip().lower())
-    # Remove repeated dots (e.g. ..)
     clean_name = re.sub(r'\.+', '.', clean_name).strip('.')
     return f"{clean_name}@amc.edu"
 
@@ -86,13 +74,10 @@ def generate_email(name, existing_email=None):
 
 def process_courses_csv(df):
     """Part A: Upload Courses"""
-    # Normalize headers
     df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-    
-    # Map varying column names to standard
     rename_map = {
         'email': 'facultyemail', 'mail': 'facultyemail',
-        'sub': 'subcode', 'code': 'subcode', 'subjectcode': 'subcode',
+        'sub': 'subcode', 'code': 'subcode',
         'faculty': 'facultyname', 'fac': 'facultyname',
         'sec': 'section', 'semester': 'sem'
     }
@@ -109,8 +94,7 @@ def process_courses_csv(df):
         raw_code = row.get('subcode', '')
         if not raw_code: continue
         
-        # 1. Clean Data
-        subcode = sanitize_key(raw_code) # Handles special chars
+        subcode = sanitize_key(raw_code)
         ay = str(row.get('ay', '2025_26')).strip()
         dept = str(row.get('dept', 'ECE')).upper().strip()
         sem = str(row.get('sem', '3')).strip()
@@ -121,7 +105,6 @@ def process_courses_csv(df):
         
         cid = f"{ay}_{dept}_{sem}_{section}_{subcode}"
         
-        # 2. Set Course
         batch.set(db.collection('Courses').document(cid), {
             "ay": ay, "dept": dept, "sem": sem, "section": section,
             "subcode": subcode,
@@ -130,17 +113,12 @@ def process_courses_csv(df):
             "faculty_name": fname
         })
         
-        # 3. Create/Update Faculty Login
-        # We merge to ensure we don't break existing passwords if they changed it
         user_ref = db.collection('Users').document(femail)
         batch.set(user_ref, {
-            "name": fname, 
-            "role": "Faculty", 
-            "dept": dept,
-            "password": "password123" # Default pwd
+            "name": fname, "role": "Faculty", "dept": dept, "password": "password123"
         }, merge=True)
         
-        logs.append(f"✅ {subcode}: Linked to {fname} ({femail})")
+        logs.append(f"Linked {subcode} -> {femail}")
         count += 1
         
         if count % 200 == 0:
@@ -161,8 +139,6 @@ def process_students_csv(df):
     batch = db.batch()
     count = 0
     
-    # Pre-fetch Course Mapping for Auto-Linking
-    # Map: "ECE_3_A" -> [ {code: 'BMATEC301', title: 'Maths'}, ... ]
     course_map = {}
     all_courses = db.collection('Courses').stream()
     for c in all_courses:
@@ -175,37 +151,25 @@ def process_students_csv(df):
         raw_usn = row.get('usn', '')
         if not raw_usn: continue
         
-        # 1. Clean Data
         usn = sanitize_key(raw_usn)
         dept = str(row.get('dept', 'ECE')).upper().strip()
         sem = str(row.get('sem', '3')).strip()
         sec = str(row.get('section', 'A')).upper().strip()
         ay = str(row.get('ay', '2025_26')).strip()
         
-        # 2. Create Student Profile
         batch.set(db.collection('Students').document(usn), {
             "name": row.get('name', 'Student'),
             "dept": dept, "sem": sem, "section": sec,
             "ay": ay, "batch": str(row.get('batch', ''))
         })
         
-        # 3. Initialize Subject Stats (Auto-Link)
-        # This ensures the student starts with 0/0 attendance
         class_key = f"{dept}_{sem}_{sec}"
         if class_key in course_map:
             summ_ref = db.collection('Student_Summaries').document(usn)
             updates = {}
             for subj in course_map[class_key]:
                 s_code = sanitize_key(subj['subcode'])
-                # We use merge=True, so we just init fields if missing
-                # Setting total=0 explicitly ensures the field exists
-                # BUT we must be careful not to reset attendance if re-running
-                # Firestore `create` is not available in batch in this SDK simply
-                # So we use a check: In a real app, this might overwrite.
-                # Here we assume Part B is run ONCE at start of sem.
                 updates[f"{s_code}.title"] = subj['subtitle']
-                # Note: We do NOT set total=0 here to avoid overwriting existing data
-                # We rely on the "Sync" tool in Admin for fixing missing fields
             
             if updates:
                 batch.set(summ_ref, updates, merge=True)
@@ -219,14 +183,10 @@ def process_students_csv(df):
     return count
 
 def admin_force_sync():
-    """
-    MAGIC FIX: Scans all students and ensures their Subject keys exist.
-    Run this if students say 'No Attendance Data'.
-    """
+    """Sync tool for missing subjects."""
     students = db.collection('Students').stream()
     courses = list(db.collection('Courses').stream())
     
-    # Build Map: "ECE_3_A" -> List of Course Dicts
     course_map = {}
     for c in courses:
         d = c.to_dict()
@@ -245,17 +205,10 @@ def admin_force_sync():
         
         if k in course_map:
             ref = db.collection('Student_Summaries').document(usn)
-            # We construct an update dictionary using dot notation
-            # This allows us to set nested fields without overwriting the whole doc
-            # AND Firestore won't overwrite existing values if we use valid logic?
-            # Actually, to be safe, we only set 'title' and ensure 'total' exists using Increment(0)
-            
             updates = {}
             for c in course_map[k]:
                 code = sanitize_key(c['subcode'])
-                # Setting title is safe
                 updates[f"{code}.title"] = c['subtitle']
-                # Increment(0) creates the field if missing, but adds 0 if exists (Safe!)
                 updates[f"{code}.total"] = firestore.Increment(0)
                 updates[f"{code}.attended"] = firestore.Increment(0)
             
@@ -277,14 +230,12 @@ def admin_force_sync():
 def faculty_dashboard(user):
     st.title(f"👨‍🏫 {user['name']}")
     
-    # 1. Fetch Assigned Courses
     my_courses = get_faculty_courses(user['id'])
     
     if not my_courses:
         st.warning("No courses linked to your email.")
         return
         
-    # Dropdown
     c_map = {f"{c['subcode']} ({c['section']})" : c for c in my_courses}
     sel_name = st.selectbox("Select Class", list(c_map.keys()))
     course = c_map[sel_name]
@@ -294,13 +245,31 @@ def faculty_dashboard(user):
     with t1:
         st.subheader(f"{course['subcode']} - {course['subtitle']}")
         
-        # 2. Fetch Students
+        # --- NEW: TIME SLOT SELECTION ---
+        c_date, c_period = st.columns(2)
+        date_val = c_date.date_input("Date", datetime.date.today())
+        period_val = c_period.selectbox("Period / Hour", ["1st Hour", "2nd Hour", "3rd Hour", "4th Hour", "5th Hour", "6th Hour", "7th Hour", "Lab Session"])
+        
+        # --- LOGIC: Check Duplicates ---
+        # Unique ID: 2024-01-01_18CS51_A_1st Hour
+        session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
+        
+        # Check if this exists in DB
+        existing_doc = db.collection('Class_Sessions').document(session_id).get()
+        already_marked = existing_doc.exists
+        
+        if already_marked:
+            st.error(f"⚠️ Attendance for **{period_val}** on {date_val} is ALREADY MARKED.")
+            overwrite = st.checkbox("I made a mistake. Allow Overwrite?")
+            if not overwrite:
+                st.stop() # Stop execution here to prevent accidental double submit
+        
+        # --- LOAD STUDENTS ---
         if st.button("🔄 Refresh List"):
             get_students_cached.clear()
             st.rerun()
             
         s_list = get_students_cached(course['dept'], course['sem'], course['section'])
-        # Sort by USN
         s_list = sorted(s_list, key=lambda x: x['usn'])
         
         if not s_list:
@@ -308,20 +277,16 @@ def faculty_dashboard(user):
             return
             
         with st.form("mark_attendance"):
-            c1, c2 = st.columns([1, 2])
-            date_val = c1.date_input("Date", datetime.date.today())
-            proxy_name = c2.text_input("Faculty Name (if proxy)", value=user['name'])
+            proxy_name = st.text_input("Faculty Name (if proxy)", value=user['name'])
             
             st.write(f"**Total Students: {len(s_list)}**")
             select_all = st.checkbox("Select All", value=True)
             
-            # Grid Layout
             cols = st.columns(4)
             status_map = {}
             
             for i, s in enumerate(s_list):
-                # Unique key prevents state retention across dates
-                ukey = f"{s['usn']}_{date_val}_{course['subcode']}"
+                ukey = f"{s['usn']}_{date_val}_{period_val}" # Unique key per student per slot
                 status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=select_all, key=ukey)
             
             if st.form_submit_button("🚀 Submit Attendance"):
@@ -329,12 +294,14 @@ def faculty_dashboard(user):
                 
                 batch = db.batch()
                 
-                # A. Audit Log
-                log_ref = db.collection('Class_Sessions').document()
+                # A. Log Session (Using Custom ID to prevent duplicates)
+                log_ref = db.collection('Class_Sessions').document(session_id)
+                
                 batch.set(log_ref, {
                     "course_code": course['subcode'],
                     "section": course['section'],
                     "date": str(date_val),
+                    "period": period_val,  # <--- NEW
                     "faculty_id": user['id'],
                     "faculty_name": proxy_name,
                     "absentees": absentees,
@@ -342,33 +309,42 @@ def faculty_dashboard(user):
                 })
                 
                 # B. Update Stats
-                sub_key = sanitize_key(course['subcode'])
-                for s in s_list:
-                    summ_ref = db.collection('Student_Summaries').document(s['usn'])
-                    
-                    # Ensure fields exist and increment
-                    batch.set(summ_ref, {
-                        f"{sub_key}.title": course['subtitle'],
-                        f"{sub_key}.total": firestore.Increment(1)
-                    }, merge=True)
-                    
-                    if s['usn'] not in absentees:
+                # NOTE: If we are Overwriting, we ideally need to "Subtract" previous logic first.
+                # However, calculating "Net Change" is complex. 
+                # Current Logic: Simple Increment.
+                # WARNING: Overwrite feature here simply updates the LOG. It does NOT correct the Student Summary count (which keeps adding).
+                # To fix Summary on Overwrite is very hard without a transaction.
+                # Recommendation: Disable Overwrite for 'Stats', allow only for 'Log'.
+                
+                if already_marked:
+                    st.warning("Session updated. Note: Student total counts were NOT incremented again to prevent double counting.")
+                else:
+                    # Only increment totals if this is a NEW session
+                    sub_key = sanitize_key(course['subcode'])
+                    for s in s_list:
+                        summ_ref = db.collection('Student_Summaries').document(s['usn'])
+                        
                         batch.set(summ_ref, {
-                            f"{sub_key}.attended": firestore.Increment(1)
+                            f"{sub_key}.title": course['subtitle'],
+                            f"{sub_key}.total": firestore.Increment(1)
                         }, merge=True)
                         
+                        if s['usn'] not in absentees:
+                            batch.set(summ_ref, {
+                                f"{sub_key}.attended": firestore.Increment(1)
+                            }, merge=True)
+                        
+                    st.success("Attendance Saved Successfully!")
+                    
                 batch.commit()
-                st.success("Attendance Saved Successfully!")
                 
     with t2:
-        # Client-side sort to avoid Index errors
         logs = list(db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream())
         data = [l.to_dict() for l in logs]
-        # Sort desc by timestamp
         data.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         
         if data:
-            st.dataframe(pd.DataFrame(data)[['date', 'course_code', 'section', 'faculty_name']], use_container_width=True)
+            st.dataframe(pd.DataFrame(data)[['date', 'period', 'course_code', 'section', 'faculty_name']], use_container_width=True)
         else:
             st.info("No history found.")
 
@@ -410,13 +386,11 @@ def student_dashboard():
                 df = pd.DataFrame(rows)
                 st.divider()
                 
-                # Metrics
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Avg Attendance", f"{df['Percentage'].mean():.1f}%")
                 m2.metric("Safe Subjects", len(df[df['Status']=='Safe']))
                 m3.metric("Critical", len(df[df['Status']=='Critical']))
                 
-                # Chart
                 c = alt.Chart(df).mark_bar().encode(
                     x='Subject',
                     y=alt.Y('Percentage', scale=alt.Scale(domain=[0, 100])),
@@ -452,9 +426,8 @@ def admin_dashboard():
 
     with t2:
         st.subheader("🛠️ Maintenance Tools")
-        st.info("Use this if Students see 'No Data' or if you added courses AFTER adding students.")
         if st.button("🔄 Sync/Fix All Student Subjects"):
-            with st.spinner("Scanning and linking missing subjects..."):
+            with st.spinner("Scanning..."):
                 n = admin_force_sync()
             st.success(f"Synced subjects for {n} students.")
 
@@ -470,7 +443,7 @@ def admin_dashboard():
         sec = c3.text_input("Sec", "A")
         if st.button("Search"):
             st.dataframe(pd.DataFrame(get_students_cached(dept, sem, sec)))
-            get_students_cached.clear() # Clear cache to refresh
+            get_students_cached.clear()
 
 # ==========================================
 # 6. MAIN
@@ -492,7 +465,6 @@ def main():
                     st.session_state['auth_user'] = {"id": "admin", "name": "Admin", "role": "Admin"}
                     st.rerun()
                 else:
-                    # Check Firestore
                     u_doc = db.collection('Users').document(uid).get()
                     if u_doc.exists and u_doc.to_dict().get('password') == pwd:
                         u = u_doc.to_dict()
