@@ -37,10 +37,15 @@ db = firestore.client()
 @st.cache_data(ttl=3600)
 def get_students_cached(dept, sem, section):
     """Fetches student list from DB."""
+    # Ensure inputs are clean before querying
+    c_dept = str(dept).strip().upper()
+    c_sem = str(sem).strip()
+    c_sec = str(section).strip().upper()
+    
     docs = db.collection('Students')\
-        .where("dept", "==", dept)\
-        .where("sem", "==", sem)\
-        .where("section", "==", section).stream()
+        .where("dept", "==", c_dept)\
+        .where("sem", "==", c_sem)\
+        .where("section", "==", c_sec).stream()
     
     return [{"usn": d.id, **d.to_dict()} for d in docs]
 
@@ -56,7 +61,8 @@ def get_faculty_courses(faculty_id):
 
 def sanitize_key(val):
     if not val: return ""
-    return str(val).strip().upper().replace(".", "_").replace("/", "_")
+    # Replace dots/slashes/spaces with underscore
+    return str(val).strip().upper().replace(".", "_").replace("/", "_").replace(" ", "")
 
 def generate_email(name, existing_email=None):
     val = str(existing_email).strip().lower()
@@ -137,6 +143,7 @@ def process_students_csv(df):
     batch = db.batch()
     count = 0
     
+    # Cache Map
     course_map = {}
     all_courses = db.collection('Courses').stream()
     for c in all_courses:
@@ -161,6 +168,7 @@ def process_students_csv(df):
             "ay": ay, "batch": str(row.get('batch', ''))
         })
         
+        # Initial Link
         class_key = f"{dept}_{sem}_{sec}"
         if class_key in course_map:
             summ_ref = db.collection('Student_Summaries').document(usn)
@@ -181,14 +189,18 @@ def process_students_csv(df):
     return count
 
 def admin_force_sync():
-    """Sync tool for missing subjects."""
+    """
+    SMART SYNC: Normalizes keys (uppercasing/stripping) to fix mismatches.
+    """
     students = db.collection('Students').stream()
     courses = list(db.collection('Courses').stream())
     
+    # 1. Build Robust Course Map
     course_map = {}
     for c in courses:
         d = c.to_dict()
-        k = f"{d['dept']}_{d['sem']}_{d['section']}"
+        # Ensure Key is normalized: ECE_3_A (no spaces)
+        k = f"{str(d['dept']).strip().upper()}_{str(d['sem']).strip()}_{str(d['section']).strip().upper()}"
         if k not in course_map: course_map[k] = []
         course_map[k].append(d)
         
@@ -199,7 +211,13 @@ def admin_force_sync():
     for s in students:
         s_data = s.to_dict()
         usn = s.id
-        k = f"{s_data.get('dept', '')}_{s_data.get('sem', '')}_{s_data.get('section', '')}"
+        
+        # 2. Normalize Student Data to match Key
+        s_dept = str(s_data.get('dept', '')).strip().upper()
+        s_sem = str(s_data.get('sem', '')).strip()
+        s_sec = str(s_data.get('section', '')).strip().upper()
+        
+        k = f"{s_dept}_{s_sem}_{s_sec}"
         
         if k in course_map:
             ref = db.collection('Student_Summaries').document(usn)
@@ -207,6 +225,7 @@ def admin_force_sync():
             for c in course_map[k]:
                 code = sanitize_key(c['subcode'])
                 updates[f"{code}.title"] = c['subtitle']
+                # Safe initialization
                 updates[f"{code}.total"] = firestore.Increment(0)
                 updates[f"{code}.attended"] = firestore.Increment(0)
             
@@ -243,12 +262,12 @@ def faculty_dashboard(user):
     with t1:
         st.subheader(f"{course['subcode']} - {course['subtitle']}")
         
-        # --- TIME SLOT SELECTION ---
+        # TIME SLOT
         c_date, c_period = st.columns(2)
         date_val = c_date.date_input("Date", datetime.date.today())
         period_val = c_period.selectbox("Period / Hour", ["1st Hour", "2nd Hour", "3rd Hour", "4th Hour", "5th Hour", "6th Hour", "7th Hour", "Lab Session"])
         
-        # --- CHECK DUPLICATES ---
+        # DUPLICATE CHECK
         session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
         existing_doc = db.collection('Class_Sessions').document(session_id).get()
         already_marked = existing_doc.exists
@@ -301,7 +320,7 @@ def faculty_dashboard(user):
                     "timestamp": datetime.datetime.now()
                 })
                 
-                # B. Update Stats (Skip stats increment if overwriting to prevent double count)
+                # B. Update Stats (Skip if duplicate)
                 if already_marked:
                     st.warning("Session updated. (Stats were NOT incremented to prevent double counting).")
                 else:
@@ -325,14 +344,13 @@ def faculty_dashboard(user):
     with t2:
         logs = list(db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream())
         
-        # --- FIX FOR KEY ERROR ---
-        # Explicitly build list of dicts ensuring all keys exist
+        # Robust History Display
         data = []
         for l in logs:
             d = l.to_dict()
             data.append({
                 "date": d.get('date', '-'),
-                "period": d.get('period', 'N/A'), # Defaults to N/A for old records
+                "period": d.get('period', 'N/A'),
                 "course_code": d.get('course_code', '-'),
                 "section": d.get('section', '-'),
                 "faculty_name": d.get('faculty_name', '-'),
@@ -359,12 +377,13 @@ def student_dashboard():
             doc = db.collection('Student_Summaries').document(usn).get()
             
             if not doc.exists:
-                st.error("USN not found. Please contact Admin.")
+                st.error(f"USN '{usn}' not found. Please contact Admin.")
                 return
             
             data = doc.to_dict()
             rows = []
             
+            # Loop through keys to find subject stats
             for code, stats in data.items():
                 if isinstance(stats, dict) and 'total' in stats:
                     tot = stats['total']
@@ -399,12 +418,13 @@ def student_dashboard():
                 st.altair_chart(c, use_container_width=True)
                 st.dataframe(df[['Subject', 'Title', 'Classes', 'Percentage', 'Status']], use_container_width=True)
             else:
-                st.warning("No subject data linked. Ask Admin to 'Sync Subjects'.")
+                st.warning("No subject data linked.")
+                st.info(f"Debug: Found profile for {usn}, but no subjects. Ask Admin to run 'Sync/Fix' tool.")
 
 def admin_dashboard():
     st.title("⚙️ Admin Dashboard")
     
-    t1, t2, t3, t4 = st.tabs(["📤 Uploads", "🔧 Tools", "👨‍🏫 Faculty", "🎓 Students"])
+    t1, t2, t3, t4 = st.tabs(["📤 Uploads", "🔧 Tools & Debug", "👨‍🏫 Faculty", "🎓 Students"])
     
     with t1:
         c1, c2 = st.columns(2)
@@ -425,9 +445,44 @@ def admin_dashboard():
     with t2:
         st.subheader("🛠️ Maintenance Tools")
         if st.button("🔄 Sync/Fix All Student Subjects"):
-            with st.spinner("Scanning..."):
+            with st.spinner("Scanning and repairing links..."):
                 n = admin_force_sync()
-            st.success(f"Synced subjects for {n} students.")
+            st.success(f"Synced subjects for {n} students. Try checking student view now.")
+
+        st.divider()
+        st.subheader("🕵️ Debug USN")
+        # DEBUG TOOL
+        d_usn = st.text_input("Enter USN to Debug").strip().upper()
+        if st.button("Inspect USN"):
+            usn = sanitize_key(d_usn)
+            doc = db.collection('Students').document(usn).get()
+            if not doc.exists:
+                st.error("Student Document not found in 'Students' collection.")
+            else:
+                d = doc.to_dict()
+                st.write("**Profile Data:**", d)
+                
+                # Check Key Match
+                dept = str(d.get('dept', '')).strip().upper()
+                sem = str(d.get('sem', '')).strip()
+                sec = str(d.get('section', '')).strip().upper()
+                key_generated = f"{dept}_{sem}_{sec}"
+                st.write(f"**System is looking for courses under key:** `{key_generated}`")
+                
+                # Check Courses
+                courses = db.collection('Courses')\
+                    .where("dept", "==", dept)\
+                    .where("sem", "==", sem)\
+                    .where("section", "==", sec).stream()
+                found_c = [c.to_dict()['subcode'] for c in courses]
+                st.write(f"**Courses found for this key:** {found_c}")
+                
+                # Check Summaries
+                sum_doc = db.collection('Student_Summaries').document(usn).get()
+                if sum_doc.exists:
+                    st.write("**Current Linked Subjects:**", sum_doc.to_dict())
+                else:
+                    st.error("No Summary Document found (Not Linked).")
 
     with t3:
         if st.button("Load Faculty"):
