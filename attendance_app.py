@@ -19,11 +19,9 @@ if 'auth_user' not in st.session_state:
 # Initialize Firebase (Crash-Proof)
 if not firebase_admin._apps:
     try:
-        # Check for Cloud Secrets first
         if "firebase" in st.secrets:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
-        # Fallback to local file
         else:
             cred = credentials.Certificate("firebase_key.json")
         firebase_admin.initialize_app(cred)
@@ -245,16 +243,13 @@ def faculty_dashboard(user):
     with t1:
         st.subheader(f"{course['subcode']} - {course['subtitle']}")
         
-        # --- NEW: TIME SLOT SELECTION ---
+        # --- TIME SLOT SELECTION ---
         c_date, c_period = st.columns(2)
         date_val = c_date.date_input("Date", datetime.date.today())
         period_val = c_period.selectbox("Period / Hour", ["1st Hour", "2nd Hour", "3rd Hour", "4th Hour", "5th Hour", "6th Hour", "7th Hour", "Lab Session"])
         
-        # --- LOGIC: Check Duplicates ---
-        # Unique ID: 2024-01-01_18CS51_A_1st Hour
+        # --- CHECK DUPLICATES ---
         session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
-        
-        # Check if this exists in DB
         existing_doc = db.collection('Class_Sessions').document(session_id).get()
         already_marked = existing_doc.exists
         
@@ -262,9 +257,8 @@ def faculty_dashboard(user):
             st.error(f"⚠️ Attendance for **{period_val}** on {date_val} is ALREADY MARKED.")
             overwrite = st.checkbox("I made a mistake. Allow Overwrite?")
             if not overwrite:
-                st.stop() # Stop execution here to prevent accidental double submit
+                st.stop() 
         
-        # --- LOAD STUDENTS ---
         if st.button("🔄 Refresh List"):
             get_students_cached.clear()
             st.rerun()
@@ -286,7 +280,7 @@ def faculty_dashboard(user):
             status_map = {}
             
             for i, s in enumerate(s_list):
-                ukey = f"{s['usn']}_{date_val}_{period_val}" # Unique key per student per slot
+                ukey = f"{s['usn']}_{date_val}_{period_val}" 
                 status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=select_all, key=ukey)
             
             if st.form_submit_button("🚀 Submit Attendance"):
@@ -294,36 +288,26 @@ def faculty_dashboard(user):
                 
                 batch = db.batch()
                 
-                # A. Log Session (Using Custom ID to prevent duplicates)
+                # A. Log Session
                 log_ref = db.collection('Class_Sessions').document(session_id)
-                
                 batch.set(log_ref, {
                     "course_code": course['subcode'],
                     "section": course['section'],
                     "date": str(date_val),
-                    "period": period_val,  # <--- NEW
+                    "period": period_val,
                     "faculty_id": user['id'],
                     "faculty_name": proxy_name,
                     "absentees": absentees,
                     "timestamp": datetime.datetime.now()
                 })
                 
-                # B. Update Stats
-                # NOTE: If we are Overwriting, we ideally need to "Subtract" previous logic first.
-                # However, calculating "Net Change" is complex. 
-                # Current Logic: Simple Increment.
-                # WARNING: Overwrite feature here simply updates the LOG. It does NOT correct the Student Summary count (which keeps adding).
-                # To fix Summary on Overwrite is very hard without a transaction.
-                # Recommendation: Disable Overwrite for 'Stats', allow only for 'Log'.
-                
+                # B. Update Stats (Skip stats increment if overwriting to prevent double count)
                 if already_marked:
-                    st.warning("Session updated. Note: Student total counts were NOT incremented again to prevent double counting.")
+                    st.warning("Session updated. (Stats were NOT incremented to prevent double counting).")
                 else:
-                    # Only increment totals if this is a NEW session
                     sub_key = sanitize_key(course['subcode'])
                     for s in s_list:
                         summ_ref = db.collection('Student_Summaries').document(s['usn'])
-                        
                         batch.set(summ_ref, {
                             f"{sub_key}.title": course['subtitle'],
                             f"{sub_key}.total": firestore.Increment(1)
@@ -340,7 +324,21 @@ def faculty_dashboard(user):
                 
     with t2:
         logs = list(db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream())
-        data = [l.to_dict() for l in logs]
+        
+        # --- FIX FOR KEY ERROR ---
+        # Explicitly build list of dicts ensuring all keys exist
+        data = []
+        for l in logs:
+            d = l.to_dict()
+            data.append({
+                "date": d.get('date', '-'),
+                "period": d.get('period', 'N/A'), # Defaults to N/A for old records
+                "course_code": d.get('course_code', '-'),
+                "section": d.get('section', '-'),
+                "faculty_name": d.get('faculty_name', '-'),
+                "timestamp": d.get('timestamp', '')
+            })
+            
         data.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         
         if data:
