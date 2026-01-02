@@ -127,9 +127,12 @@ def batch_process_part_a(df):
     return count, logs
 
 def batch_process_part_b(df):
-    """Part B: Students"""
+    """Part B: Students (Updated with AY support)"""
+    # 1. Standardize Headers
     df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-    rename_map = {'sec': 'section', 'semester': 'sem'}
+    
+    # 2. Smart Rename
+    rename_map = {'sec': 'section', 'semester': 'sem', 'academic': 'ay', 'year': 'ay'}
     df = df.rename(columns=rename_map)
     df = df.fillna("")
     
@@ -139,7 +142,7 @@ def batch_process_part_b(df):
     batch = db.batch()
     count = 0
     
-    # Pre-fetch courses for Auto-Linking
+    # Pre-fetch courses map
     course_map = {}
     for c in db.collection('Courses').stream():
         d = c.to_dict()
@@ -154,15 +157,19 @@ def batch_process_part_b(df):
         dept = str(row.get('dept', 'ECE')).upper().strip()
         sem = str(row.get('sem', '3')).strip()
         sec = str(row.get('section', 'A')).upper().strip()
+        ay = str(row.get('ay', '2025_26')).strip()  # <--- NEW: Capture AY
         
-        # 1. Create Student
+        # 1. Create Student Profile
         batch.set(db.collection('Students').document(usn), {
             "name": row.get('name', 'Student'),
-            "dept": dept, "sem": sem, "section": sec,
-            "batch": str(row.get('batch', ''))
+            "dept": dept, 
+            "sem": sem, 
+            "section": sec,
+            "batch": str(row.get('batch', '')),
+            "ay": ay  # <--- NEW: Save AY to Database
         })
         
-        # 2. Auto-Link
+        # 2. Auto-Link Subjects
         key = f"{dept}_{sem}_{sec}"
         if key in course_map:
             summ_ref = db.collection('Student_Summaries').document(usn)
