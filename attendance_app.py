@@ -30,9 +30,6 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # --- OPTIMIZATION: CACHED READS ---
-# This prevents reading 60 documents every time the page refreshes.
-# It saves 95% of your Firestore Read Quota.
-
 @st.cache_data(ttl=3600) # Cache for 1 hour
 def get_students_cached(dept, sem, section):
     """Fetches student list once and keeps it in memory."""
@@ -41,7 +38,6 @@ def get_students_cached(dept, sem, section):
         .where("sem", "==", sem)\
         .where("section", "==", section).stream()
     
-    # Return as a list of dictionaries
     return [{"usn": d.id, "name": d.to_dict().get('name', 'Student')} for d in docs]
 
 @st.cache_data(ttl=600) # Cache course list for 10 mins
@@ -190,21 +186,19 @@ def faculty_dashboard(user):
     with t1:
         st.info(f"Marking: **{course['subtitle']}** ({course['subcode']})")
         
-        # 2. Get Students (Cached - Saves Reads)
-        # We explicitly clear cache if user wants to reload
+        # Refresh Button for Cache
         if st.button("🔄 Refresh Student List"):
             get_students_cached.clear()
             st.rerun()
             
         s_list = get_students_cached(course['dept'], course['sem'], course['section'])
-        # Sort manually since cache returns unsorted list sometimes
         s_list = sorted(s_list, key=lambda x: x['usn'])
         
         if not s_list:
             st.error("No students found in this section.")
             return
 
-        # 3. Form
+        # Form
         with st.form("att_form"):
             c1, c2 = st.columns([1, 2])
             dt = c1.date_input("Date", datetime.date.today())
@@ -212,7 +206,6 @@ def faculty_dashboard(user):
             
             st.write(f"**Class Strength: {len(s_list)}**")
             
-            # Select All Toggle
             select_all = st.checkbox("Select All Present", value=True)
             
             status = {}
@@ -226,7 +219,6 @@ def faculty_dashboard(user):
                 batch = db.batch()
                 
                 # A. Log Session
-                # Using add() instead of document() to let Firestore auto-generate ID
                 sess_ref = db.collection('Class_Sessions').document() 
                 batch.set(sess_ref, {
                     "course_code": course['subcode'],
@@ -239,13 +231,10 @@ def faculty_dashboard(user):
                 })
                 
                 # B. Update Student Stats (CRITICAL FIX)
-                # We use Increment. If the field doesn't exist (e.g. upload error),
-                # Firestore will create it and set it to the increment value.
                 for s in s_list:
                     ref = db.collection('Student_Summaries').document(s['usn'])
                     key = course['subcode']
                     
-                    # Ensure the Title exists (in case Part B didn't link it)
                     batch.set(ref, {
                         f"{key}.title": course['subtitle'],
                         f"{key}.total": firestore.Increment(1)
@@ -257,18 +246,26 @@ def faculty_dashboard(user):
                         }, merge=True)
                 
                 batch.commit()
-                st.success("Attendance Saved! Please check 'My History' tab.")
+                st.success("Attendance Saved! Check 'My History'.")
                 
     with t2:
-        # Show last 5 logs for this faculty
-        logs = db.collection('Class_Sessions')\
+        # --- CRITICAL FIX FOR ERROR ---
+        # Instead of sorting in DB (which requires index), we sort in Python
+        logs_stream = db.collection('Class_Sessions')\
             .where("faculty_id", "==", user['id'])\
-            .order_by("timestamp", direction=firestore.Query.DESCENDING)\
-            .limit(5).stream()
+            .stream()
             
+        # Convert to list
+        all_logs = [l.to_dict() for l in logs_stream]
+        
+        # Sort in Python (Reverse Time)
+        all_logs.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        # Take Top 10
+        recent_logs = all_logs[:10]
+        
         data = []
-        for l in logs:
-            d = l.to_dict()
+        for d in recent_logs:
             data.append({
                 "Date": d['date'],
                 "Subject": d['course_code'],
@@ -316,12 +313,10 @@ def student_public_dashboard():
                 df = pd.DataFrame(rows)
                 st.divider()
                 
-                # Metrics
                 m1, m2, m3 = st.columns(3)
                 m1.metric("Overall Avg", f"{df['Percentage'].mean():.1f}%")
                 m2.metric("Critical Subjects", len(df[df['Status']=='Critical']))
                 
-                # Chart
                 c = alt.Chart(df).mark_bar().encode(
                     x='Subject', 
                     y=alt.Y('Percentage', scale=alt.Scale(domain=[0,100])),
@@ -369,7 +364,6 @@ def admin_dashboard():
         sec = c3.text_input("Sec", "A")
         if st.button("Search Students"):
             st.dataframe(pd.DataFrame(get_students_cached(dept, sem, sec)))
-            # Clear cache to ensure fresh data next time
             get_students_cached.clear()
 
 # ==========================================
