@@ -4,6 +4,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import datetime
 import altair as alt
+import re
 
 # ==========================================
 # 1. ROBUST SETUP & SESSION STATE
@@ -11,7 +12,7 @@ import altair as alt
 
 st.set_page_config(page_title="VTU Attendance System", page_icon="🎓", layout="wide")
 
-# Initialize Session State ONLY ONCE to prevent logouts
+# Initialize Session State ONLY ONCE
 if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
 
@@ -35,13 +36,24 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ==========================================
-# 2. SMART DATA PROCESSING
+# 2. SMART DATA PROCESSING (FIXED)
 # ==========================================
+
+def clean_email(val, name_fallback):
+    """
+    Returns a valid email string. 
+    If missing, generates one from the faculty name.
+    """
+    val = str(val).strip().lower()
+    if not val or val == 'nan' or val == 'none' or val == '':
+        # Generate dummy email from name: 'John Doe' -> 'john.doe@amc.edu'
+        sanitized_name = re.sub(r'[^a-zA-Z0-9]', '.', str(name_fallback).strip().lower())
+        return f"{sanitized_name}@amc.edu"
+    return val
 
 def batch_process_part_a(df):
     """
     Part A: Courses & Faculty
-    Smart mapping for columns like 'Email', 'Mail', 'Sub Code'
     """
     # 1. Normalize Headers
     df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
@@ -54,52 +66,54 @@ def batch_process_part_a(df):
         'sec': 'section', 'semister': 'sem', 'semester': 'sem'
     }
     df = df.rename(columns=rename_map)
+    df = df.fillna("") # Replace actual NaNs with empty string
     
-    # 3. Validation
-    required = ['subcode', 'facultyemail']
-    missing = [c for c in required if c not in df.columns]
-    
-    if missing:
-        return 0, [f"❌ Error: CSV missing columns {missing}. Found: {list(df.columns)}"]
+    # 3. Check Critical Columns
+    if 'subcode' not in df.columns:
+        return 0, ["❌ Error: 'SubCode' column missing in CSV."]
 
-    df = df.fillna("")
     batch = db.batch()
     count = 0
     logs = []
     
     for idx, row in df.iterrows():
-        # Skip invalid rows
-        if not row['subcode'] or not row['facultyemail']:
+        # Skip if SubCode is missing (Absolute requirement)
+        if not row['subcode']:
             continue
             
-        # Defaults if columns missing
-        ay = str(row.get('ay', '2024')).strip()
-        dept = str(row.get('dept', 'CS')).upper().strip()
-        sem = str(row.get('sem', '1')).strip()
+        # Extract Data with Fallbacks
+        ay = str(row.get('ay', '2025_26')).strip()
+        dept = str(row.get('dept', 'ECE')).upper().strip()
+        sem = str(row.get('sem', '3')).strip()
         section = str(row.get('section', 'A')).upper().strip()
+        subcode = str(row['subcode']).strip().upper()
         
-        cid = f"{ay}_{dept}_{sem}_{section}_{row['subcode'].upper()}"
+        # FIX: Handle Empty Faculty Email/Name
+        fac_name = str(row.get('facultyname', 'Unknown Faculty')).strip()
+        fac_email = clean_email(row.get('facultyemail', ''), fac_name)
+        
+        # Create Course ID
+        cid = f"{ay}_{dept}_{sem}_{section}_{subcode}"
         
         # 1. Set Course
         batch.set(db.collection('Courses').document(cid), {
             "ay": ay, "dept": dept, "sem": sem, "section": section,
-            "subcode": str(row['subcode']).upper(),
-            "subtitle": str(row.get('subtitle', row['subcode'])),
-            "faculty_id": str(row['facultyemail']).lower().strip(),
-            "faculty_name": str(row.get('facultyname', 'Faculty'))
+            "subcode": subcode,
+            "subtitle": str(row.get('subtitle', subcode)),
+            "faculty_id": fac_email,
+            "faculty_name": fac_name
         })
         
-        # 2. Set Faculty Login (Merge to avoid overwriting existing pwd)
-        fid = str(row['facultyemail']).lower().strip()
-        user_ref = db.collection('Users').document(fid)
+        # 2. Set Faculty Login (Auto-Create)
+        user_ref = db.collection('Users').document(fac_email)
         batch.set(user_ref, {
-            "name": str(row.get('facultyname', 'Faculty')),
+            "name": fac_name,
             "role": "Faculty",
             "dept": dept,
-            "password": "password123" # Default, change manually if needed
+            "password": "password123" # Default Password
         }, merge=True)
         
-        logs.append(f"Linked {row['subcode']} -> {fid}")
+        logs.append(f"✅ {subcode}: Linked to {fac_name} ({fac_email})")
         count += 1
         
         if count % 200 == 0:
@@ -112,15 +126,13 @@ def batch_process_part_a(df):
 def batch_process_part_b(df):
     """Part B: Students"""
     df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-    
-    # Smart Rename
     rename_map = {'sec': 'section', 'semester': 'sem'}
     df = df.rename(columns=rename_map)
+    df = df.fillna("")
     
     if 'usn' not in df.columns:
         return 0
         
-    df = df.fillna("")
     batch = db.batch()
     count = 0
     
@@ -136,8 +148,8 @@ def batch_process_part_b(df):
         if not row['usn']: continue
         
         usn = str(row['usn']).upper().strip()
-        dept = str(row.get('dept', 'CS')).upper().strip()
-        sem = str(row.get('sem', '1')).strip()
+        dept = str(row.get('dept', 'ECE')).upper().strip()
+        sem = str(row.get('sem', '3')).strip()
         sec = str(row.get('section', 'A')).upper().strip()
         
         # 1. Create Student
@@ -168,7 +180,7 @@ def batch_process_part_b(df):
     return count
 
 # ==========================================
-# 3. ADMIN DASHBOARD (Fixes: Dropdowns & Visibility)
+# 3. ADMIN DASHBOARD
 # ==========================================
 
 def tab_bulk_upload():
@@ -214,14 +226,13 @@ def tab_manage_faculty():
 def tab_manage_students():
     st.subheader("🎓 Student Management")
     
-    # 1. FILTER TOOL (Fixes "No Dropdown" issue)
+    # FILTER TOOL
     st.info("Step 1: Find Students")
     c1, c2, c3 = st.columns(3)
-    f_dept = c1.text_input("Dept", "CS")
-    f_sem = c2.text_input("Sem", "5")
+    f_dept = c1.text_input("Dept", "ECE")
+    f_sem = c2.text_input("Sem", "3")
     f_sec = c3.text_input("Section", "A")
     
-    # State to hold search results to prevent disappear on rerun
     if 'search_results' not in st.session_state: st.session_state['search_results'] = []
 
     if st.button("🔍 Search Class"):
@@ -231,20 +242,17 @@ def tab_manage_students():
             .where("section", "==", f_sec).stream()
         st.session_state['search_results'] = [{"USN": d.id, **d.to_dict()} for d in docs]
     
-    # Display Results with USN
     if st.session_state['search_results']:
         df_res = pd.DataFrame(st.session_state['search_results'])
         st.dataframe(df_res, use_container_width=True)
         
-        # 2. EDIT TOOL
+        # EDIT TOOL
         st.divider()
         st.write("### ✏️ Edit Student")
-        # Populate dropdown with USNs found
         usn_list = df_res['USN'].tolist()
         sel_usn = st.selectbox("Select USN to Edit", usn_list)
         
         if sel_usn:
-            # Fetch current data
             curr = next((item for item in st.session_state['search_results'] if item["USN"] == sel_usn), {})
             
             with st.form("edit_stu"):
@@ -258,7 +266,6 @@ def tab_manage_students():
                         "name": en, "dept": ed, "sem": es, "section": esec
                     })
                     st.success(f"Updated {sel_usn}!")
-                    # Clear cache to force refresh next time
                     st.session_state['search_results'] = []
     else:
         st.write("No students loaded yet.")
@@ -277,21 +284,18 @@ def admin_dashboard():
 def faculty_dashboard(user):
     st.header(f"👨‍🏫 Welcome, {user['name']}")
     
-    # 1. Get Courses
     courses = list(db.collection('Courses').where("faculty_id", "==", user['id']).stream())
     
     if not courses:
         st.warning("No courses assigned.")
         return
 
-    # Dropdown
     c_map = {f"{c.to_dict()['subcode']} ({c.to_dict()['section']})" : c.to_dict() for c in courses}
     sel = st.selectbox("Select Class", list(c_map.keys()))
     course = c_map[sel]
     
     st.divider()
     
-    # 2. Get Students
     students = db.collection('Students')\
         .where("dept", "==", course['dept'])\
         .where("sem", "==", course['sem'])\
@@ -303,11 +307,9 @@ def faculty_dashboard(user):
         st.error("No students found.")
         return
 
-    # 3. Mark Attendance
     with st.form("att_form"):
         c1, c2 = st.columns([1, 2])
         dt = c1.date_input("Date", datetime.date.today())
-        # Editable Name
         fname = c2.text_input("Faculty Handling Class", value=course['faculty_name'])
         
         st.write("### Student List")
@@ -322,12 +324,9 @@ def faculty_dashboard(user):
             
             # Log
             batch.set(db.collection('Class_Sessions').document(), {
-                "course_code": course['subcode'],
-                "section": course['section'],
-                "date": str(dt),
-                "faculty_name": fname,
-                "absentees": absentees,
-                "timestamp": datetime.datetime.now()
+                "course_code": course['subcode'], "section": course['section'],
+                "date": str(dt), "faculty_name": fname,
+                "absentees": absentees, "timestamp": datetime.datetime.now()
             })
             
             # Update
@@ -376,7 +375,6 @@ def student_public_dashboard():
             if rows:
                 df = pd.DataFrame(rows)
                 st.divider()
-                # Chart
                 c = alt.Chart(df).mark_bar().encode(
                     x='Subject', 
                     y=alt.Y('Percentage', scale=alt.Scale(domain=[0,100])),
