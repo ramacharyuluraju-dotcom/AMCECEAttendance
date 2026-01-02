@@ -189,9 +189,7 @@ def process_students_csv(df):
     return count
 
 def admin_force_sync():
-    """
-    SMART SYNC: Normalizes keys (uppercasing/stripping) to fix mismatches.
-    """
+    """SMART SYNC: Normalizes keys and links subjects."""
     students = db.collection('Students').stream()
     courses = list(db.collection('Courses').stream())
     
@@ -225,7 +223,7 @@ def admin_force_sync():
             for c in course_map[k]:
                 code = sanitize_key(c['subcode'])
                 updates[f"{code}.title"] = c['subtitle']
-                # Safe initialization
+                # Safe initialization (keeps existing value if present)
                 updates[f"{code}.total"] = firestore.Increment(0)
                 updates[f"{code}.attended"] = firestore.Increment(0)
             
@@ -320,13 +318,14 @@ def faculty_dashboard(user):
                     "timestamp": datetime.datetime.now()
                 })
                 
-                # B. Update Stats (Skip if duplicate)
+                # B. Update Stats
                 if already_marked:
                     st.warning("Session updated. (Stats were NOT incremented to prevent double counting).")
                 else:
                     sub_key = sanitize_key(course['subcode'])
                     for s in s_list:
                         summ_ref = db.collection('Student_Summaries').document(s['usn'])
+                        # Writing Flat Keys (Consistent with DB)
                         batch.set(summ_ref, {
                             f"{sub_key}.title": course['subtitle'],
                             f"{sub_key}.total": firestore.Increment(1)
@@ -381,10 +380,26 @@ def student_dashboard():
                 return
             
             data = doc.to_dict()
-            rows = []
             
-            # Loop through keys to find subject stats
-            for code, stats in data.items():
+            # --- CRITICAL FIX: UN-FLATTEN THE DATA ---
+            # Your DB has 'BEC501.total': 0. This loop converts it to structure.
+            structured_data = {}
+            for k, v in data.items():
+                if "." in k:
+                    # Handle keys like 'BEC501.total'
+                    parts = k.split('.')
+                    if len(parts) >= 2:
+                        code = parts[0]
+                        field = parts[1]
+                        if code not in structured_data: structured_data[code] = {}
+                        structured_data[code][field] = v
+                else:
+                    # Handle keys that are already nested (if any)
+                    if isinstance(v, dict):
+                        structured_data[k] = v
+
+            rows = []
+            for code, stats in structured_data.items():
                 if isinstance(stats, dict) and 'total' in stats:
                     tot = stats['total']
                     att = stats.get('attended', 0)
@@ -419,7 +434,7 @@ def student_dashboard():
                 st.dataframe(df[['Subject', 'Title', 'Classes', 'Percentage', 'Status']], use_container_width=True)
             else:
                 st.warning("No subject data linked.")
-                st.info(f"Debug: Found profile for {usn}, but no subjects. Ask Admin to run 'Sync/Fix' tool.")
+                st.info(f"Debug: Found profile for {usn}, but no subjects linked. Ask Admin to run 'Sync/Fix' tool.")
 
 def admin_dashboard():
     st.title("⚙️ Admin Dashboard")
@@ -451,7 +466,6 @@ def admin_dashboard():
 
         st.divider()
         st.subheader("🕵️ Debug USN")
-        # DEBUG TOOL
         d_usn = st.text_input("Enter USN to Debug").strip().upper()
         if st.button("Inspect USN"):
             usn = sanitize_key(d_usn)
@@ -462,14 +476,12 @@ def admin_dashboard():
                 d = doc.to_dict()
                 st.write("**Profile Data:**", d)
                 
-                # Check Key Match
                 dept = str(d.get('dept', '')).strip().upper()
                 sem = str(d.get('sem', '')).strip()
                 sec = str(d.get('section', '')).strip().upper()
                 key_generated = f"{dept}_{sem}_{sec}"
                 st.write(f"**System is looking for courses under key:** `{key_generated}`")
                 
-                # Check Courses
                 courses = db.collection('Courses')\
                     .where("dept", "==", dept)\
                     .where("sem", "==", sem)\
@@ -477,7 +489,6 @@ def admin_dashboard():
                 found_c = [c.to_dict()['subcode'] for c in courses]
                 st.write(f"**Courses found for this key:** {found_c}")
                 
-                # Check Summaries
                 sum_doc = db.collection('Student_Summaries').document(usn).get()
                 if sum_doc.exists:
                     st.write("**Current Linked Subjects:**", sum_doc.to_dict())
