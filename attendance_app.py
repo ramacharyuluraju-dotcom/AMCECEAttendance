@@ -1,33 +1,32 @@
 import streamlit as st
 import pandas as pd
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, firestore
 import datetime
 import altair as alt
-import io
 
 # ==========================================
-# 1. SETUP
+# 1. SETUP & CONFIGURATION
 # ==========================================
 
-st.set_page_config(page_title="VTU Attendance", page_icon="🎓", layout="wide")
+st.set_page_config(page_title="VTU Attendance System", page_icon="🎓", layout="wide")
 
 # Initialize Firebase
 if not firebase_admin._apps:
     try:
-        # Cloud Secrets
+        # 1. Cloud Secrets Strategy
         key_dict = dict(st.secrets["firebase"])
         cred = credentials.Certificate(key_dict)
     except:
-        # Local File
+        # 2. Local File Strategy
         try:
             cred = credentials.Certificate("firebase_key.json")
         except:
-            st.error("Missing firebase_key.json or Secrets.")
+            st.error("🚨 Critical Error: No 'firebase_key.json' found. Please check deployment instructions.")
             st.stop()
             
-    BUCKET_NAME = "your-project-id.appspot.com" 
-    firebase_admin.initialize_app(cred, {'storageBucket': BUCKET_NAME})
+    BUCKET_NAME = "your-project-id.appspot.com" # Replace if using Storage
+    firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
@@ -35,146 +34,115 @@ if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
 
 # ==========================================
-# 2. CORE FUNCTIONS
+# 2. DATA PROCESSING (Updated for Batch/AY)
 # ==========================================
 
-def standardize_columns(df, required_cols):
-    """
-    Tries to map uploaded columns to required standard keys.
-    Returns: (Renamed DataFrame, List of Missing Columns)
-    """
-    # Normalize current headers: lowercase, remove spaces/special chars
+def clean_df(df):
+    """Cleans headers to be lower_case_no_spaces"""
     df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-    
-    # Map common variations to standard keys
-    # Key = Standard, Value = List of possible variations found in normalized headers
-    mapping = {}
-    missing = []
-    
-    for req in required_cols:
-        if req in df.columns:
-            continue # Already exists
-        else:
-            missing.append(req)
-            
-    return df, missing
+    return df.fillna("")
 
-def batch_process_courses(df):
-    """Part A: Upload Courses"""
-    # 1. Normalize Headers
-    df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-    
-    # 2. Check for missing columns
-    required = ['ay', 'dept', 'sem', 'section', 'subcode', 'subtitle', 'facultyname', 'facultyemail']
-    missing = [col for col in required if col not in df.columns]
-    
-    if missing:
-        st.error(f"❌ CSV is missing columns: {', '.join(missing)}")
-        st.info(f"Found headers: {list(df.columns)}")
-        return 0
-
-    df = df.fillna("")
+def batch_process_part_a(df):
+    """
+    Part A: Courses & Faculty
+    Columns: AY, Dept, Sem, Section, SubCode, SubTitle, FacName, FacEmail
+    """
+    df = clean_df(df)
     batch = db.batch()
     count = 0
+    logs = []
     
     for _, row in df.iterrows():
-        # Skip empty rows
-        if not row['subcode'] or not row['facultyemail']:
+        # Validation
+        if not row.get('subcode') or not row.get('facultyemail'):
             continue
             
-        # Data Cleaning
-        ay = str(row['ay']).strip()
-        dept = str(row['dept']).strip().upper()
-        sem = str(row['sem']).strip()
-        section = str(row['section']).strip().upper()
-        subcode = str(row['subcode']).strip().upper()
-        subtitle = str(row['subtitle']).strip()
-        fac_email = str(row['facultyemail']).strip().lower()
-        fac_name = str(row['facultyname']).strip()
-
-        # ID: AY_Dept_Sem_Sec_SubCode
-        cid = f"{ay}_{dept}_{sem}_{section}_{subcode}"
+        cid = f"{row['ay']}_{row['dept']}_{row['sem']}_{row['section']}_{row['subcode']}"
         
-        # Save Course
+        # 1. Create Course
         batch.set(db.collection('Courses').document(cid), {
-            "ay": ay, "dept": dept, "sem": sem, "section": section,
-            "subcode": subcode, "subtitle": subtitle,
-            "faculty_id": fac_email, "faculty_name": fac_name
+            "ay": str(row['ay']),
+            "dept": str(row['dept']).upper(),
+            "sem": str(row['sem']),
+            "section": str(row['section']).upper(),
+            "subcode": str(row['subcode']).upper(),
+            "subtitle": str(row['subtitle']),
+            "faculty_id": str(row['facultyemail']).lower().strip(),
+            "faculty_name": str(row['facultyname'])
         })
         
-        # Create Faculty Login
-        if fac_email:
-            u_ref = db.collection('Users').document(fac_email)
-            if not u_ref.get().exists:
-                batch.set(u_ref, {
-                    "name": fac_name, "password": "password123", "role": "Faculty", "dept": dept
-                })
-            
+        # 2. Create Faculty Login (if not exists)
+        fid = str(row['facultyemail']).lower().strip()
+        user_ref = db.collection('Users').document(fid)
+        # We perform a quick read to avoid overwriting existing passwords
+        # But in bulk upload, we ensure the user exists.
+        batch.set(user_ref, {
+            "name": row['facultyname'],
+            "role": "Faculty",
+            "dept": str(row['dept']).upper(),
+            # Only set default password if creating new
+            "password": "password123" 
+        }, merge=True)
+        
+        logs.append(f"Linked {row['subcode']} to {row['facultyname']}")
+        
         count += 1
-        if count % 400 == 0:
+        if count % 200 == 0:
             batch.commit()
             batch = db.batch()
             
     batch.commit()
-    return count
+    return count, logs
 
-def batch_process_students(df):
-    """Part B: Upload Students"""
-    df.columns = [str(c).strip().lower().replace(" ", "").replace("_", "") for c in df.columns]
-    
-    required = ['usn', 'name', 'dept', 'sem', 'section']
-    missing = [col for col in required if col not in df.columns]
-    
-    if missing:
-        st.error(f"❌ CSV is missing columns: {', '.join(missing)}")
-        return 0
-
-    df = df.fillna("")
+def batch_process_part_b(df):
+    """
+    Part B: Students
+    Columns: USN, Name, Dept, Sem, Section, Batch (New!)
+    """
+    df = clean_df(df)
     batch = db.batch()
     count = 0
     
-    # Pre-fetch courses to optimize speed (avoid querying inside loop)
-    # We group courses by "Dept_Sem_Sec" key
+    # Pre-fetch courses to optimize linking
+    # Map: "CS_5_A" -> [{'code': '18CS51', 'title': 'DBMS'}]
+    course_map = {}
     all_courses = db.collection('Courses').stream()
-    course_map = {} # Key: "CS_5_A", Value: List of subcodes/titles
-    
     for c in all_courses:
         d = c.to_dict()
         key = f"{d['dept']}_{d['sem']}_{d['section']}"
         if key not in course_map: course_map[key] = []
-        course_map[key].append({"code": d['subcode'], "title": d['subtitle']})
-    
-    for _, row in df.iterrows():
-        if not row['usn']: continue
-            
-        usn = str(row['usn']).strip().upper()
-        dept = str(row['dept']).strip().upper()
-        sem = str(row['sem']).strip()
-        sec = str(row['section']).strip().upper()
-        name = str(row['name']).strip()
+        course_map[key].append(d)
         
-        # 1. Save Profile
+    for _, row in df.iterrows():
+        if not row.get('usn'): continue
+        
+        usn = str(row['usn']).upper().strip()
+        dept = str(row['dept']).upper().strip()
+        sem = str(row['sem']).strip()
+        sec = str(row['section']).upper().strip()
+        
+        # 1. Create Student Profile
         batch.set(db.collection('Students').document(usn), {
-            "name": name, "dept": dept, "sem": sem, "section": sec
+            "name": row['name'],
+            "dept": dept,
+            "sem": sem,
+            "section": sec,
+            "batch": str(row.get('batch', '')) # Added Batch
         })
         
-        # 2. Auto-Link Subjects from Memory Map
+        # 2. Auto-Link Subjects
         key = f"{dept}_{sem}_{sec}"
         if key in course_map:
             summ_ref = db.collection('Student_Summaries').document(usn)
             updates = {}
             for subj in course_map[key]:
-                # Prepare update: "18CS51.total": 0 (using Merge to not overwrite existing attendance)
-                updates[f"{subj['code']}.total"] = 0
-                updates[f"{subj['code']}.attended"] = 0
-                updates[f"{subj['code']}.title"] = subj['title']
+                # Initialize stats if not present
+                code = subj['subcode']
+                updates[f"{code}.total"] = 0
+                updates[f"{code}.attended"] = 0
+                updates[f"{code}.title"] = subj['subtitle']
             
-            # Note: We must check if doc exists to determine merge strategy, 
-            # but here we use simple merge. 
-            # Ideally, we only set initial values if keys don't exist, 
-            # but Firestore merge will overwrite 0.
-            # FIX: Only set title/total=0 if we want to reset. 
-            # For "Add New Student", this is fine.
+            # Using merge=True to safely add new subjects without erasing old ones
             batch.set(summ_ref, updates, merge=True)
             
         count += 1
@@ -186,173 +154,326 @@ def batch_process_students(df):
     return count
 
 # ==========================================
-# 3. VIEWS
+# 3. ADMIN TABS (NEW!)
 # ==========================================
 
-def student_public_view():
-    st.markdown("<h1 style='text-align: center;'>🎓 Student Portal</h1>", unsafe_allow_html=True)
+def tab_bulk_upload():
+    c1, c2 = st.columns(2)
     
-    c1, c2, c3 = st.columns([1, 2, 1])
+    with c1:
+        st.subheader("📤 1. Upload Courses (Part A)")
+        st.info("Required: AY, Dept, Sem, Section, SubCode, SubTitle, FacultyName, FacultyEmail")
+        f1 = st.file_uploader("Courses CSV", type='csv', key='a')
+        if f1 and st.button("Process Courses"):
+            try:
+                c, logs = batch_process_part_a(pd.read_csv(f1))
+                st.success(f"✅ Processed {c} records.")
+                with st.expander("View Logs"):
+                    st.write(logs)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
     with c2:
-        usn_input = st.text_input("Enter USN", placeholder="1MV20CS001").strip().upper()
-        if st.button("Check Attendance", use_container_width=True):
-            if not usn_input: return
+        st.subheader("📤 2. Upload Students (Part B)")
+        st.info("Required: USN, Name, Dept, Sem, Section, Batch")
+        f2 = st.file_uploader("Students CSV", type='csv', key='b')
+        if f2 and st.button("Process Students"):
+            try:
+                c = batch_process_part_b(pd.read_csv(f2))
+                st.success(f"✅ Registered {c} students & linked subjects.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+def tab_manage_faculty():
+    st.subheader("👨‍🏫 Manage Faculty Logins")
+    
+    # 1. Manual Creation
+    with st.expander("➕ Add New Faculty Manually"):
+        with st.form("add_fac"):
+            c1, c2, c3 = st.columns(3)
+            new_email = c1.text_input("Email (Login ID)").strip().lower()
+            new_name = c2.text_input("Full Name")
+            new_dept = c3.text_input("Dept (e.g. CS)")
+            if st.form_submit_button("Create Login"):
+                if new_email and new_name:
+                    db.collection('Users').document(new_email).set({
+                        "name": new_name, "password": "password123", 
+                        "role": "Faculty", "dept": new_dept
+                    })
+                    st.success(f"Created user for {new_name}")
+                else:
+                    st.error("Email and Name are required.")
+
+    # 2. View List
+    st.divider()
+    st.write("### Existing Faculty List")
+    if st.button("🔄 Refresh List"):
+        docs = db.collection('Users').where("role", "==", "Faculty").stream()
+        data = [{"Email": d.id, **d.to_dict()} for d in docs]
+        if data:
+            st.dataframe(pd.DataFrame(data), use_container_width=True)
+        else:
+            st.info("No faculty found.")
+
+def tab_manage_students():
+    st.subheader("🎓 Manage Students")
+    
+    # 1. Search/Edit Single
+    with st.container():
+        c1, c2 = st.columns([1, 3])
+        search_usn = c1.text_input("Enter USN to Edit").strip().upper()
+        if c1.button("Search USN"):
+            doc = db.collection('Students').document(search_usn).get()
+            if doc.exists:
+                d = doc.to_dict()
+                with c2.form("edit_stu"):
+                    st.write(f"Editing: **{search_usn}**")
+                    en = st.text_input("Name", value=d.get('name', ''))
+                    ed = st.text_input("Dept", value=d.get('dept', ''))
+                    es = st.text_input("Sem", value=d.get('sem', ''))
+                    esec = st.text_input("Section", value=d.get('section', ''))
+                    ebatch = st.text_input("Batch", value=d.get('batch', ''))
+                    
+                    if st.form_submit_button("Update Student"):
+                        db.collection('Students').document(search_usn).update({
+                            "name": en, "dept": ed, "sem": es, 
+                            "section": esec, "batch": ebatch
+                        })
+                        st.success("Updated!")
+            else:
+                c2.error("Student not found.")
+
+def tab_manage_courses():
+    st.subheader("📚 Manage Subjects (SubCodes)")
+    
+    # Filter to avoid loading 1000s of rows
+    col1, col2 = st.columns(2)
+    f_dept = col1.text_input("Filter by Dept", "CS")
+    f_sem = col2.text_input("Filter by Sem", "5")
+    
+    if st.button("Load Courses"):
+        docs = db.collection('Courses')\
+            .where("dept", "==", f_dept)\
+            .where("sem", "==", f_sem).stream()
             
-            doc = db.collection('Student_Summaries').document(usn_input).get()
+        data = []
+        for d in docs:
+            dd = d.to_dict()
+            dd['id'] = d.id # capture doc ID for updates
+            data.append(dd)
+            
+        if data:
+            st.write(f"Found {len(data)} courses.")
+            # Display as a table
+            df = pd.DataFrame(data)
+            st.dataframe(df[['subcode', 'subtitle', 'section', 'faculty_name', 'faculty_id']])
+            
+            st.info("To edit, use the form below with the specific SubCode and Section.")
+            
+            with st.form("edit_course_form"):
+                st.write("#### Edit Specific Course")
+                ec_code = st.text_input("SubCode (e.g. 18CS51)").strip().upper()
+                ec_sec = st.text_input("Section (e.g. A)").strip().upper()
+                
+                new_title = st.text_input("New Title (Optional)")
+                new_fac_email = st.text_input("New Faculty Email (Optional)")
+                
+                if st.form_submit_button("Update Course"):
+                    # We need to reconstruct the ID to find it
+                    # ID format: AY_Dept_Sem_Sec_SubCode
+                    # This is tricky because we don't know AY here easily.
+                    # Alternative: Query by fields
+                    q = db.collection('Courses')\
+                        .where("subcode", "==", ec_code)\
+                        .where("section", "==", ec_sec)\
+                        .where("dept", "==", f_dept).stream()
+                    
+                    found = False
+                    for qd in q:
+                        found = True
+                        upd = {}
+                        if new_title: upd['subtitle'] = new_title
+                        if new_fac_email: 
+                            upd['faculty_id'] = new_fac_email
+                            # Optional: fetch faculty name for consistency
+                            fdoc = db.collection('Users').document(new_fac_email).get()
+                            if fdoc.exists:
+                                upd['faculty_name'] = fdoc.to_dict()['name']
+                        
+                        db.collection('Courses').document(qd.id).update(upd)
+                    
+                    if found: st.success("Course updated!")
+                    else: st.error("Course not found with those details.")
+        else:
+            st.warning("No courses found for this filter.")
+
+# ==========================================
+# 4. VIEW CONTROLLERS
+# ==========================================
+
+def admin_dashboard():
+    st.title("⚙️ Super Admin Dashboard")
+    
+    tabs = st.tabs([
+        "📤 Bulk Uploads", 
+        "👨‍🏫 Manage Faculty", 
+        "🎓 Manage Students", 
+        "📚 Manage Courses"
+    ])
+    
+    with tabs[0]: tab_bulk_upload()
+    with tabs[1]: tab_manage_faculty()
+    with tabs[2]: tab_manage_students()
+    with tabs[3]: tab_manage_courses()
+
+def faculty_dashboard(user):
+    st.title(f"👨‍🏫 Welcome, {user['name']}")
+    
+    # 1. Fetch Courses
+    courses = list(db.collection('Courses').where("faculty_id", "==", user['id']).stream())
+    
+    if not courses:
+        st.warning("No courses assigned to you.")
+        return
+
+    # Dropdown
+    c_map = {f"{c.to_dict()['subcode']} ({c.to_dict()['section']})" : c.to_dict() for c in courses}
+    sel = st.selectbox("Select Class to Mark", list(c_map.keys()))
+    course = c_map[sel]
+    
+    st.divider()
+    
+    # 2. Fetch Students
+    students = db.collection('Students')\
+        .where("dept", "==", course['dept'])\
+        .where("sem", "==", course['sem'])\
+        .where("section", "==", course['section']).stream()
+        
+    s_list = sorted([{"usn": d.id, "name": d.to_dict()['name']} for d in students], key=lambda x: x['usn'])
+    
+    if not s_list:
+        st.error("No students found in this section.")
+        return
+
+    # 3. Mark Attendance
+    with st.form("attendance_form"):
+        c1, c2 = st.columns([1, 2])
+        date_val = c1.date_input("Date", datetime.date.today())
+        # Editable Faculty Name for Substitutes
+        fac_name = c2.text_input("Faculty Handling Class", value=course['faculty_name'])
+        
+        st.write("### Student List")
+        status = {}
+        cols = st.columns(4)
+        for i, s in enumerate(s_list):
+            status[s['usn']] = cols[i%4].checkbox(s['usn'], value=True)
+            
+        if st.form_submit_button("Submit Attendance"):
+            absentees = [k for k,v in status.items() if not v]
+            
+            batch = db.batch()
+            
+            # Log Session
+            batch.set(db.collection('Class_Sessions').document(), {
+                "course_code": course['subcode'],
+                "section": course['section'],
+                "date": str(date_val),
+                "faculty_name": fac_name,
+                "absentees": absentees,
+                "timestamp": datetime.datetime.now()
+            })
+            
+            # Update Totals
+            for s in s_list:
+                ref = db.collection('Student_Summaries').document(s['usn'])
+                key = course['subcode']
+                
+                batch.set(ref, {
+                    f"{key}.total": firestore.Increment(1),
+                    f"{key}.title": course['subtitle']
+                }, merge=True)
+                
+                if s['usn'] not in absentees:
+                    batch.set(ref, {f"{key}.attended": firestore.Increment(1)}, merge=True)
+            
+            batch.commit()
+            st.balloons()
+            st.success("Attendance Saved Successfully!")
+
+def student_public_dashboard():
+    st.markdown("<h1 style='text-align: center;'>🎓 Student Attendance Portal</h1>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        usn = st.text_input("Enter USN (e.g. 1MV20CS001)").strip().upper()
+        if st.button("Check Status", use_container_width=True):
+            if not usn:
+                st.warning("Please enter a USN.")
+                return
+            
+            doc = db.collection('Student_Summaries').document(usn).get()
             if not doc.exists:
                 st.error("USN not found.")
                 return
-                
+            
             data = doc.to_dict()
             rows = []
             for sub, stats in data.items():
                 if isinstance(stats, dict) and 'total' in stats:
                     tot = stats['total']
                     att = stats.get('attended', 0)
-                    pct = (att / tot * 100) if tot > 0 else 0
+                    pct = (att/tot*100) if tot > 0 else 0.0
                     status = "Safe" if pct >= 85 else ("Warning" if pct >= 75 else "Critical")
-                    rows.append({"Subject": sub, "Title": stats.get('title', sub), "Percentage": pct, "Status": status, "Classes": f"{att}/{tot}"})
+                    rows.append({
+                        "Subject": sub, "Title": stats.get('title', sub),
+                        "Percentage": pct, "Status": status, "Classes": f"{att}/{tot}"
+                    })
             
             if rows:
                 df = pd.DataFrame(rows)
-                st.divider()
                 
                 # Metrics
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Average", f"{df['Percentage'].mean():.1f}%")
-                c2.metric("Safe", len(df[df['Status']=='Safe']))
-                c3.metric("Critical", len(df[df['Status']=='Critical']))
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Avg Attendance", f"{df['Percentage'].mean():.1f}%")
+                m2.metric("Safe Subjects", len(df[df['Status']=='Safe']))
+                m3.metric("Critical", len(df[df['Status']=='Critical']))
+                
+                st.divider()
                 
                 # Chart
-                base = alt.Chart(df).encode(x=alt.X('Subject', sort=None))
-                bar = base.mark_bar().encode(
-                    y=alt.Y('Percentage', scale=alt.Scale(domain=[0, 100])),
-                    color=alt.Color('Percentage', scale=alt.Scale(domain=[0, 75, 85, 100], range=['red', 'orange', 'green', 'green']), legend=None),
-                    tooltip=['Title', 'Classes', 'Percentage']
-                )
-                rule = base.mark_rule(color='red', strokeDash=[5,5]).encode(y=alt.datum(75))
-                st.altair_chart(bar + rule, use_container_width=True)
-            else:
-                st.info("No attendance data linked.")
-
-def faculty_view(user):
-    st.title(f"👨‍🏫 {user['name']}")
-    courses = list(db.collection('Courses').where("faculty_id", "==", user['id']).stream())
-    
-    if not courses:
-        st.warning("No courses assigned.")
-        return
-
-    c_map = {f"{d.to_dict()['subcode']} ({d.to_dict()['section']})": d.to_dict() for d in courses}
-    sel_name = st.selectbox("Select Class", list(c_map.keys()))
-    course = c_map[sel_name]
-    
-    st.divider()
-    
-    students = db.collection('Students')\
-        .where("dept", "==", course['dept'])\
-        .where("sem", "==", course['sem'])\
-        .where("section", "==", course['section']).stream()
-    
-    s_list = sorted([{"usn": d.id, "name": d.to_dict()['name']} for d in students], key=lambda x: x['usn'])
-    
-    if not s_list:
-        st.error("No students found.")
-        return
-
-    with st.form("mark"):
-        c1, c2 = st.columns([1, 2])
-        dt = c1.date_input("Date", datetime.date.today())
-        fname = c2.text_input("Faculty Name", value=course['faculty_name'])
-        
-        st.write(f"**Students: {len(s_list)}**")
-        status = {}
-        cols = st.columns(4)
-        for i, s in enumerate(s_list):
-            status[s['usn']] = cols[i%4].checkbox(f"{s['usn']}", value=True)
-            
-        if st.form_submit_button("Submit Attendance"):
-            absentees = [u for u, p in status.items() if not p]
-            batch = db.batch()
-            
-            batch.set(db.collection('Class_Sessions').document(), {
-                "course_code": course['subcode'], "section": course['section'],
-                "date": str(dt), "faculty_name": fname, "absentees": absentees,
-                "timestamp": datetime.datetime.now()
-            })
-            
-            for s in s_list:
-                ref = db.collection('Student_Summaries').document(s['usn'])
-                key = course['subcode']
-                # Increment total
-                batch.set(ref, {f"{key}.total": firestore.Increment(1), f"{key}.title": course['subtitle']}, merge=True)
-                # Increment attended if present
-                if s['usn'] not in absentees:
-                    batch.set(ref, {f"{key}.attended": firestore.Increment(1)}, merge=True)
+                c = alt.Chart(df).mark_bar().encode(
+                    x='Subject', 
+                    y=alt.Y('Percentage', scale=alt.Scale(domain=[0,100])),
+                    color=alt.Color('Percentage', scale=alt.Scale(domain=[0, 75, 85, 100], range=['red', 'orange', 'green', 'green']), legend=None)
+                ).properties(height=300)
                 
-            batch.commit()
-            st.success("Saved!")
-
-def admin_view():
-    st.title("⚙️ Admin Panel")
-    t1, t2 = st.tabs(["Part A: Courses", "Part B: Students"])
-    
-    # --- HELPER: Sample CSV Generator ---
-    def get_csv_download(type_):
-        if type_ == 'A':
-            data = "AY,Dept,Sem,Section,SubCode,SubTitle,FacultyName,FacultyEmail\n2024,CS,5,A,18CS51,DBMS,John Doe,john@college.edu"
-            name = "template_courses.csv"
-        else:
-            data = "USN,Name,Dept,Sem,Section\n1MV20CS001,Rahul,CS,5,A"
-            name = "template_students.csv"
-        return st.download_button(f"⬇️ Download {name}", data, name, "text/csv")
-
-    with t1:
-        c1, c2 = st.columns([3, 1])
-        c1.info("Upload 'Courses' CSV. Headers must be exact.")
-        with c2: get_csv_download('A')
-            
-        f = st.file_uploader("Upload Courses", type='csv', key='a')
-        if f and st.button("Process A"):
-            try:
-                c = batch_process_courses(pd.read_csv(f))
-                if c > 0: st.success(f"✅ {c} Courses Created.")
-            except Exception as e:
-                st.error(f"Error: {e}")
-            
-    with t2:
-        c1, c2 = st.columns([3, 1])
-        c1.info("Upload 'Students' CSV.")
-        with c2: get_csv_download('B')
-            
-        f = st.file_uploader("Upload Students", type='csv', key='b')
-        if f and st.button("Process B"):
-            try:
-                c = batch_process_students(pd.read_csv(f))
-                if c > 0: st.success(f"✅ {c} Students Registered.")
-            except Exception as e:
-                st.error(f"Error: {e}")
+                st.altair_chart(c, use_container_width=True)
+                st.dataframe(df[['Subject', 'Title', 'Classes', 'Percentage', 'Status']], use_container_width=True)
+            else:
+                st.info("No attendance records found yet.")
 
 # ==========================================
-# 4. MAIN
+# 5. MAIN ROUTER
 # ==========================================
 
 def main():
+    # Sidebar Login
     with st.sidebar:
-        st.title("Staff Login")
+        st.header("🔐 Staff Login")
         if st.session_state['auth_user']:
-            st.success(f"Hi, {st.session_state['auth_user']['name']}")
+            st.success(f"User: {st.session_state['auth_user']['name']}")
             if st.button("Logout"):
                 st.session_state['auth_user'] = None
                 st.rerun()
         else:
-            uid = st.text_input("Email/ID")
+            uid = st.text_input("Email / Admin ID")
             pwd = st.text_input("Password", type="password")
             if st.button("Login"):
                 if uid == "admin" and pwd == "admin123":
-                    st.session_state['auth_user'] = {"id": "admin", "name": "Admin", "role": "Admin"}
+                    st.session_state['auth_user'] = {"id": "admin", "name": "Administrator", "role": "Admin"}
                     st.rerun()
                 else:
+                    # Check Firestore Users
                     doc = db.collection('Users').document(uid).get()
                     if doc.exists and doc.to_dict().get('password') == pwd:
                         u = doc.to_dict()
@@ -360,14 +481,18 @@ def main():
                         st.session_state['auth_user'] = u
                         st.rerun()
                     else:
-                        st.error("Invalid")
+                        st.error("Invalid Credentials")
 
+    # Routing
     user = st.session_state['auth_user']
+    
     if user:
-        if user['role'] == 'Admin': admin_view()
-        else: faculty_view(user)
+        if user['role'] == "Admin":
+            admin_dashboard()
+        elif user['role'] == "Faculty":
+            faculty_dashboard(user)
     else:
-        student_public_view()
+        student_public_dashboard()
 
 if __name__ == "__main__":
     main()
