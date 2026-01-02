@@ -35,44 +35,65 @@ if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
 
 # ==========================================
-# 2. CORE FUNCTIONS
+# 2. CORE FUNCTIONS (BUG FIXED HERE)
 # ==========================================
 
 def clean_headers(df):
     """Standardize CSV headers"""
-    df.columns = [c.strip().lower().replace(" ", "") for c in df.columns]
+    # Force convert headers to string to avoid errors
+    df.columns = [str(c).strip().lower().replace(" ", "") for c in df.columns]
     return df
 
 def batch_process_courses(df):
     """Part A: Upload Courses & Create Faculty Logins"""
     df = clean_headers(df)
+    
+    # FIX: Fill empty cells with empty strings to prevent 'float' errors
+    df = df.fillna("")
+    
     batch = db.batch()
     count = 0
     
     for _, row in df.iterrows():
+        # Safety Check: Skip rows where essential data is missing
+        if not row.get('subcode') or not row.get('facultyemail'):
+            continue
+
+        # Convert everything to string explicitly to prevent crashes
+        ay = str(row['ay']).strip()
+        dept = str(row['dept']).strip().upper()
+        sem = str(row['sem']).strip()
+        section = str(row['section']).strip().upper()
+        subcode = str(row['subcode']).strip().upper()
+        subtitle = str(row['subtitle']).strip()
+        fac_email = str(row['facultyemail']).strip().lower()
+        fac_name = str(row['facultyname']).strip()
+
         # ID: AY_Dept_Sem_Sec_SubCode
-        cid = f"{row['ay']}_{row['dept']}_{row['sem']}_{row['section']}_{row['subcode']}"
+        cid = f"{ay}_{dept}_{sem}_{section}_{subcode}"
         
         batch.set(db.collection('Courses').document(cid), {
-            "ay": str(row['ay']),
-            "dept": row['dept'].upper(),
-            "sem": str(row['sem']),
-            "section": row['section'].upper(),
-            "subcode": row['subcode'].upper(),
-            "subtitle": row['subtitle'],
-            "faculty_id": row['facultyemail'].lower().strip(),
-            "faculty_name": row['facultyname']
+            "ay": ay,
+            "dept": dept,
+            "sem": sem,
+            "section": section,
+            "subcode": subcode,
+            "subtitle": subtitle,
+            "faculty_id": fac_email,
+            "faculty_name": fac_name
         })
         
         # Create Faculty Login
-        fid = row['facultyemail'].lower().strip()
-        if not db.collection('Users').document(fid).get().exists:
-            batch.set(db.collection('Users').document(fid), {
-                "name": row['facultyname'],
-                "password": "password123",
-                "role": "Faculty",
-                "dept": row['dept'].upper()
-            })
+        if fac_email:
+            # Check if user exists to avoid overwriting existing passwords if needed
+            # (Here we overwrite to ensure Part A is the source of truth)
+            if not db.collection('Users').document(fac_email).get().exists:
+                batch.set(db.collection('Users').document(fac_email), {
+                    "name": fac_name,
+                    "password": "password123",
+                    "role": "Faculty",
+                    "dept": dept
+                })
             
         count += 1
         if count % 400 == 0:
@@ -84,22 +105,30 @@ def batch_process_courses(df):
 def batch_process_students(df):
     """Part B: Upload Students & Link Subjects"""
     df = clean_headers(df)
+    df = df.fillna("") # Fix empty cells
+    
     batch = db.batch()
     count = 0
     
     for _, row in df.iterrows():
+        # Safety Check
+        if not row.get('usn'):
+            continue
+            
         usn = str(row['usn']).strip().upper()
-        dept = row['dept'].upper()
-        sem = str(row['sem'])
-        sec = row['section'].upper()
+        dept = str(row['dept']).strip().upper()
+        sem = str(row['sem']).strip()
+        sec = str(row['section']).strip().upper()
+        name = str(row['name']).strip()
         
         # 1. Save Profile
         batch.set(db.collection('Students').document(usn), {
-            "name": row['name'],
+            "name": name,
             "dept": dept, "sem": sem, "section": sec
         })
         
         # 2. Auto-Link Subjects: Find courses for this section
+        # NOTE: In production, it's better to fetch courses ONCE outside the loop
         courses = db.collection('Courses')\
             .where("dept", "==", dept)\
             .where("sem", "==", sem)\
@@ -267,15 +296,21 @@ def admin_view():
         st.info("CSV: AY, Dept, Sem, Section, SubCode, SubTitle, FacultyName, FacultyEmail")
         f = st.file_uploader("Upload Courses", type='csv', key='a')
         if f and st.button("Process A"):
-            c = batch_process_courses(pd.read_csv(f))
-            st.success(f"{c} Courses Created.")
+            try:
+                c = batch_process_courses(pd.read_csv(f))
+                st.success(f"{c} Courses Created.")
+            except Exception as e:
+                st.error(f"Error processing CSV: {e}")
             
     with t2:
         st.info("CSV: USN, Name, Dept, Sem, Section")
         f = st.file_uploader("Upload Students", type='csv', key='b')
         if f and st.button("Process B"):
-            c = batch_process_students(pd.read_csv(f))
-            st.success(f"{c} Students Registered.")
+            try:
+                c = batch_process_students(pd.read_csv(f))
+                st.success(f"{c} Students Registered.")
+            except Exception as e:
+                st.error(f"Error processing CSV: {e}")
 
 # ==========================================
 # 5. MAIN NAVIGATION
