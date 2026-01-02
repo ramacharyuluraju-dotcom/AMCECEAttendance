@@ -16,27 +16,30 @@ st.set_page_config(page_title="VTU Attendance System", page_icon="🎓", layout=
 if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
 
-# Initialize Firebase
+# --- FIXED FIREBASE INITIALIZATION ---
+# This block prevents the "App already exists" crash
 if not firebase_admin._apps:
     try:
-        # 1. Cloud Secrets Strategy
-        key_dict = dict(st.secrets["firebase"])
-        cred = credentials.Certificate(key_dict)
-    except:
-        # 2. Local File Strategy
-        try:
+        # 1. Cloud Secrets Strategy (Streamlit Cloud)
+        if "firebase" in st.secrets:
+            key_dict = dict(st.secrets["firebase"])
+            cred = credentials.Certificate(key_dict)
+        # 2. Local File Strategy (Localhost)
+        else:
             cred = credentials.Certificate("firebase_key.json")
-        except:
-            st.error("🚨 Critical Error: No 'firebase_key.json' found. Please check deployment instructions.")
-            st.stop()
             
-    BUCKET_NAME = "your-project-id.appspot.com" 
-    firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(cred)
+    except ValueError:
+        # If app is already initialized, just ignore the error
+        pass
+    except Exception as e:
+        st.error(f"🚨 Critical Firebase Error: {e}")
+        st.stop()
 
 db = firestore.client()
 
 # ==========================================
-# 2. SMART DATA PROCESSING (FIXED)
+# 2. SMART DATA PROCESSING
 # ==========================================
 
 def clean_email(val, name_fallback):
@@ -45,8 +48,9 @@ def clean_email(val, name_fallback):
     If missing, generates one from the faculty name.
     """
     val = str(val).strip().lower()
+    # Check for empty or garbage values like 'nan', 'none'
     if not val or val == 'nan' or val == 'none' or val == '':
-        # Generate dummy email from name: 'John Doe' -> 'john.doe@amc.edu'
+        # Generate dummy email: 'John Doe' -> 'john.doe@amc.edu'
         sanitized_name = re.sub(r'[^a-zA-Z0-9]', '.', str(name_fallback).strip().lower())
         return f"{sanitized_name}@amc.edu"
     return val
@@ -66,9 +70,9 @@ def batch_process_part_a(df):
         'sec': 'section', 'semister': 'sem', 'semester': 'sem'
     }
     df = df.rename(columns=rename_map)
-    df = df.fillna("") # Replace actual NaNs with empty string
+    df = df.fillna("") 
     
-    # 3. Check Critical Columns
+    # 3. Validation
     if 'subcode' not in df.columns:
         return 0, ["❌ Error: 'SubCode' column missing in CSV."]
 
@@ -77,7 +81,7 @@ def batch_process_part_a(df):
     logs = []
     
     for idx, row in df.iterrows():
-        # Skip if SubCode is missing (Absolute requirement)
+        # Skip if SubCode is missing
         if not row['subcode']:
             continue
             
@@ -92,7 +96,6 @@ def batch_process_part_a(df):
         fac_name = str(row.get('facultyname', 'Unknown Faculty')).strip()
         fac_email = clean_email(row.get('facultyemail', ''), fac_name)
         
-        # Create Course ID
         cid = f"{ay}_{dept}_{sem}_{section}_{subcode}"
         
         # 1. Set Course
@@ -110,7 +113,7 @@ def batch_process_part_a(df):
             "name": fac_name,
             "role": "Faculty",
             "dept": dept,
-            "password": "password123" # Default Password
+            "password": "password123" 
         }, merge=True)
         
         logs.append(f"✅ {subcode}: Linked to {fac_name} ({fac_email})")
@@ -189,17 +192,23 @@ def tab_bulk_upload():
         st.subheader("📤 1. Courses (Part A)")
         f1 = st.file_uploader("Upload CSV (Part A)", type='csv', key='a')
         if f1 and st.button("Process Part A"):
-            c, logs = batch_process_part_a(pd.read_csv(f1))
-            st.success(f"Processed {c} records.")
-            if logs:
+            try:
+                c, logs = batch_process_part_a(pd.read_csv(f1))
+                st.success(f"Processed {c} records.")
                 with st.expander("Show Logs"):
                     st.write(logs)
+            except Exception as e:
+                st.error(f"Error processing file: {e}")
+                
     with c2:
         st.subheader("📤 2. Students (Part B)")
         f2 = st.file_uploader("Upload CSV (Part B)", type='csv', key='b')
         if f2 and st.button("Process Part B"):
-            c = batch_process_part_b(pd.read_csv(f2))
-            st.success(f"Registered {c} students.")
+            try:
+                c = batch_process_part_b(pd.read_csv(f2))
+                st.success(f"Registered {c} students.")
+            except Exception as e:
+                st.error(f"Error processing file: {e}")
 
 def tab_manage_faculty():
     st.subheader("👨‍🏫 Faculty Management")
