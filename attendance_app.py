@@ -25,6 +25,7 @@ if 'admin_search_usn' not in st.session_state:
 # Initialize Firebase
 if not firebase_admin._apps:
     try:
+        # Check if secrets exist (Streamlit Cloud), otherwise look for local file
         if "firebase" in st.secrets:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
@@ -52,7 +53,7 @@ def get_students_cached(dept, sem, section):
             .where("sem", "==", c_sem)\
             .where("section", "==", c_sec).stream()
         return [{"usn": d.id, **d.to_dict()} for d in docs]
-    except Exception as e:
+    except Exception:
         return []
 
 @st.cache_data(ttl=10) 
@@ -105,7 +106,6 @@ def generate_session_report(dept, start_date, end_date):
             d = s.to_dict()
             subcode = d.get('course_code', '')
             
-            # Filter purely in Python to be safe
             if subcode in course_lookup:
                 info = course_lookup[subcode]
                 data.append({
@@ -122,77 +122,79 @@ def generate_session_report(dept, start_date, end_date):
                 })
         return pd.DataFrame(data)
     except Exception as e:
-        st.error(f"Error generating report: {e}")
+        st.error(f"Report Error: {e}")
         return pd.DataFrame()
 
 def generate_student_summary_report(dept, sem, section):
     """Generates a Consolidated Student-wise Report (Pivot Table)"""
-    students = get_students_cached(dept, sem, section)
-    if not students: return pd.DataFrame()
-    
-    raw_data = []
-    all_subjects = set()
-    
-    for s in students:
-        usn = s['usn']
-        name = s.get('name', 'Unknown')
+    try:
+        students = get_students_cached(dept, sem, section)
+        if not students: return pd.DataFrame()
         
-        doc = db.collection('Student_Summaries').document(usn).get()
-        structured = {}
+        raw_data = []
+        all_subjects = set()
         
-        if doc.exists:
-            data = doc.to_dict()
-            for k, v in data.items():
-                if "." in k:
-                    try:
-                        code, field = k.split('.')[0], k.split('.')[1]
-                        if code not in structured: structured[code] = {}
-                        structured[code][field] = v
-                    except: pass
-        
-        student_row = {
-            "AY": s.get('ay', '2025_26'),
-            "Dept": dept,
-            "Sem": sem, 
-            "Section": section,
-            "USN": usn, 
-            "Name": name
-        }
-        
-        # If no summary exists, initialize with 0
-        if not structured:
-            try:
-                courses = db.collection('Courses').where("dept", "==", dept)\
-                    .where("sem", "==", sem).where("section", "==", section).stream()
-                for c in courses:
-                    sc = sanitize_key(c.to_dict().get('subcode'))
-                    if sc:
-                        student_row[sc] = 0.0
-                        all_subjects.add(sc)
-            except: pass
-        else:
-            for code, stats in structured.items():
-                tot = stats.get('total', 0)
-                att = stats.get('attended', 0)
-                pct = 100.0 if tot == 0 else round((att / tot * 100), 1)
-                student_row[code] = pct
-                all_subjects.add(code)
-        
-        raw_data.append(student_row)
-
-    if raw_data:
-        df = pd.DataFrame(raw_data)
-        base_cols = ["AY", "Dept", "Sem", "Section", "USN", "Name"]
-        subj_cols = sorted(list(all_subjects))
-        
-        # Ensure columns exist
-        for sc in subj_cols:
-            if sc not in df.columns: df[sc] = 0.0
+        for s in students:
+            usn = s['usn']
+            name = s.get('name', 'Unknown')
             
-        final_cols = [c for c in base_cols if c in df.columns] + subj_cols
-        return df[final_cols].sort_values(by="USN").fillna(0)
-        
-    return pd.DataFrame()
+            doc = db.collection('Student_Summaries').document(usn).get()
+            structured = {}
+            
+            if doc.exists:
+                data = doc.to_dict()
+                for k, v in data.items():
+                    if "." in k:
+                        try:
+                            code, field = k.split('.')[0], k.split('.')[1]
+                            if code not in structured: structured[code] = {}
+                            structured[code][field] = v
+                        except: pass
+            
+            student_row = {
+                "AY": s.get('ay', '2025_26'),
+                "Dept": dept,
+                "Sem": sem, 
+                "Section": section,
+                "USN": usn, 
+                "Name": name
+            }
+            
+            # Initialize 0 for empty summaries
+            if not structured:
+                try:
+                    courses = db.collection('Courses').where("dept", "==", dept)\
+                        .where("sem", "==", sem).where("section", "==", section).stream()
+                    for c in courses:
+                        sc = sanitize_key(c.to_dict().get('subcode'))
+                        if sc:
+                            student_row[sc] = 0.0
+                            all_subjects.add(sc)
+                except: pass
+            else:
+                for code, stats in structured.items():
+                    tot = stats.get('total', 0)
+                    att = stats.get('attended', 0)
+                    pct = 100.0 if tot == 0 else round((att / tot * 100), 1)
+                    student_row[code] = pct
+                    all_subjects.add(code)
+            
+            raw_data.append(student_row)
+
+        if raw_data:
+            df = pd.DataFrame(raw_data)
+            base_cols = ["AY", "Dept", "Sem", "Section", "USN", "Name"]
+            subj_cols = sorted(list(all_subjects))
+            
+            for sc in subj_cols:
+                if sc not in df.columns: df[sc] = 0.0
+                
+            final_cols = [c for c in base_cols if c in df.columns] + subj_cols
+            return df[final_cols].sort_values(by="USN").fillna(0)
+            
+        return pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame()
 
 # ==========================================
 # 5. CSV PROCESSORS
@@ -219,14 +221,12 @@ def process_courses_csv(df):
         
         cid = f"{ay}_{dept}_{sem}_{section}_{subcode}"
         
-        # Course Doc
         batch.set(db.collection('Courses').document(cid), {
             "ay": ay, "dept": dept, "sem": sem, "section": section,
             "subcode": subcode, "subtitle": str(row.get('subtitle', subcode)),
             "faculty_id": femail, "faculty_name": fname
         })
         
-        # User Doc
         batch.set(db.collection('Users').document(femail), {
             "name": fname, "role": "Faculty", "dept": dept, "password": "password123"
         }, merge=True)
@@ -243,13 +243,11 @@ def process_students_csv(df):
     if 'usn' not in df.columns: return 0
     
     batch = db.batch(); count = 0
-    
-    # Pre-fetch course map
     course_map = {}
     try:
         for c in db.collection('Courses').stream():
             d = c.to_dict()
-            k = f"{d['dept']}_{d['sem']}_{d['section']}"
+            k = f"{d.get('dept')}_{d.get('sem')}_{d.get('section')}"
             if k not in course_map: course_map[k] = []
             course_map[k].append(d)
     except: pass
@@ -268,15 +266,15 @@ def process_students_csv(df):
             "dept": dept, "sem": sem, "section": sec, "ay": ay, "batch": str(row.get('batch', ''))
         })
         
-        # Link Courses
         k = f"{dept}_{sem}_{sec}"
         if k in course_map:
             updates = {}
             for subj in course_map[k]:
-                code = sanitize_key(subj['subcode'])
-                updates[f"{code}.title"] = subj['subtitle']
-                updates[f"{code}.total"] = firestore.Increment(0)
-                updates[f"{code}.attended"] = firestore.Increment(0)
+                code = sanitize_key(subj.get('subcode'))
+                if code:
+                    updates[f"{code}.title"] = subj.get('subtitle', code)
+                    updates[f"{code}.total"] = firestore.Increment(0)
+                    updates[f"{code}.attended"] = firestore.Increment(0)
             if updates: 
                 batch.set(db.collection('Student_Summaries').document(usn), updates, merge=True)
         
@@ -340,6 +338,7 @@ def render_report_tab(prefix=""):
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
     c1, c2 = st.columns(2)
+    # UNIQUE KEYS PREVENT JUMPING
     l_start = c1.date_input("From Date", datetime.date.today().replace(day=1), key=f'{prefix}rep_start_date')
     l_end = c2.date_input("To Date", datetime.date.today(), key=f'{prefix}rep_end_date')
     
@@ -353,19 +352,22 @@ def render_report_tab(prefix=""):
 
 def faculty_dashboard(user):
     st.title(f"👨‍🏫 {user['name']}")
+    
+    # --- FIX: DEFINE TABS FIRST TO PREVENT RESETS ---
+    tab_attendance, tab_history, tab_reports = st.tabs(["📝 Attendance", "📜 History", "📊 Reports"])
+    
+    # Fetch Data
     my_courses = get_faculty_courses(user['id'])
     
-    t1, t2, t3 = st.tabs(["📝 Attendance", "📜 History", "📊 Reports"])
-    
-    with t1:
+    with tab_attendance:
         if not my_courses:
             st.warning("No courses assigned.")
         else:
-            c_map = {f"{c['subcode']} ({c['section']})" : c for c in my_courses}
-            sel_name = st.selectbox("Select Class", list(c_map.keys()))
+            c_map = {f"{c.get('subcode','?')} ({c.get('section','?')})" : c for c in my_courses}
+            sel_name = st.selectbox("Select Class", list(c_map.keys()), key='fac_sel_class')
             course = c_map[sel_name]
             
-            st.caption(f"Marking: {course['subtitle']} | {course['dept']} {course['sem']}-{course['section']}")
+            st.caption(f"Marking: {course.get('subtitle','')} | {course.get('dept','')} {course.get('sem','')}-{course.get('section','')}")
             
             c_date, c_period = st.columns(2)
             date_val = c_date.date_input("Date", datetime.date.today(), key='mark_date')
@@ -410,8 +412,7 @@ def faculty_dashboard(user):
                         else:
                             st.warning("Log updated. Stats not incremented.")
                         batch.commit()
-    with t2:
-        # Fetch logs WITHOUT server-side sorting (avoids Index Error)
+    with tab_history:
         try:
             logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream()
             logs = sorted([l for l in logs_stream], key=lambda x: x.to_dict().get('date', ''), reverse=True)
@@ -421,28 +422,24 @@ def faculty_dashboard(user):
                 for l in logs:
                     d = l.to_dict()
                     d_date = d.get('date', 'Unknown')
-                    d_period = d.get('period', '-')
-                    d_code = d.get('course_code', '?')
                     tot = d.get('total_students', 0)
-                    
                     if tot == 0: 
                         tot = len(get_students_cached(d.get('dept','ECE'), d.get('sem','3'), d.get('section','A'))) 
-                    
                     present = tot - len(d.get('absentees', []))
                     data.append({
                         "Date": d_date, 
-                        "Period": d_period, 
-                        "Class": d_code, 
+                        "Period": d.get('period', '-'), 
+                        "Class": d.get('course_code', '?'), 
                         "Present": f"{present}/{tot}"
                     })
-                
                 st.dataframe(pd.DataFrame(data), use_container_width=True)
             else:
                 st.info("No history found.")
-        except Exception as e:
-            st.error(f"Error loading history: {e}")
+        except Exception:
+            st.info("No history available.")
 
-    with t3:
+    with tab_reports:
+        # Pass Prefix to ensure unique IDs
         render_report_tab(prefix="fac_")
 
 def admin_dashboard():
@@ -486,14 +483,10 @@ def admin_dashboard():
                     clean_email = n_email.strip().lower()
                     if clean_email:
                         db.collection('Users').document(clean_email).set({
-                            "name": n_name, 
-                            "role": "Faculty", 
-                            "dept": n_dept, 
-                            "password": n_pass
+                            "name": n_name, "role": "Faculty", "dept": n_dept, "password": n_pass
                         })
                         st.success(f"Created Faculty: {clean_email}")
-                    else:
-                        st.error("Email is required.")
+                    else: st.error("Email is required.")
         
         with tab_manage:
             sel_dept = st.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], key='fac_dept')
@@ -503,7 +496,6 @@ def admin_dashboard():
                     f_map = {f.to_dict().get('name','Unknown'): f.id for f in facs}
                     sel_fac = st.selectbox("Select Faculty", list(f_map.keys()))
                     fid = f_map[sel_fac]
-                    
                     courses = list(db.collection('Courses').where("faculty_id", "==", fid).stream())
                     if courses:
                         for c in courses:
@@ -512,11 +504,10 @@ def admin_dashboard():
                                 new_email = st.text_input("Reassign to (Email):", key=c.id)
                                 if st.button("Update", key=f"btn_{c.id}"):
                                     db.collection('Courses').document(c.id).update({"faculty_id": new_email.strip().lower()})
-                                    st.success("Reassigned")
-                                    st.rerun()
+                                    st.success("Reassigned"); st.rerun()
                     else: st.info("No courses.")
                 else: st.warning("No faculty found.")
-            except: st.error("Error loading faculty list.")
+            except: st.error("Error loading faculty.")
 
     with t5:
         st.subheader("Manage Students")
@@ -535,16 +526,13 @@ def admin_dashboard():
                 if doc.exists:
                     d = doc.to_dict()
                     st.markdown("---")
-                    # Normal Font Size for Headers
                     st.subheader(f"{d.get('name', 'N/A')}")
                     st.caption(f"USN: {s_in}")
-                    
                     with st.container(border=True):
                         c1, c2, c3 = st.columns(3)
                         c1.text(f"Dept: {d.get('dept', '-')}")
                         c2.text(f"Sem: {d.get('sem', '-')}")
                         c3.text(f"Section: {d.get('section', '-')}")
-
                     st.write("")
                     with st.expander("⚠️ Danger Zone (Delete Student)"):
                         st.warning("Action cannot be undone. Deletes student AND attendance stats.")
@@ -553,10 +541,9 @@ def admin_dashboard():
                                 db.collection('Students').document(s_in).delete()
                                 db.collection('Student_Summaries').document(s_in).delete()
                                 st.success("Student Deleted Successfully.")
-                                st.session_state['admin_search_usn'] = "" # Clear search
+                                st.session_state['admin_search_usn'] = ""
                                 st.rerun()
-                else:
-                    st.warning(f"Student '{s_in}' not found.")
+                else: st.warning(f"Student '{s_in}' not found.")
         with ta:
             with st.form("manual_stu"):
                 m_usn = st.text_input("USN").upper(); m_name = st.text_input("Name")
@@ -564,7 +551,6 @@ def admin_dashboard():
                 m_sec = st.text_input("Sec", "A").upper()
                 if st.form_submit_button("Add"):
                     db.collection('Students').document(m_usn).set({"name":m_name,"dept":m_dept,"sem":m_sem,"section":m_sec,"ay":"2025_26"})
-                    # Auto Link
                     courses = db.collection('Courses').where("dept", "==", m_dept).where("sem", "==", m_sem).where("section", "==", m_sec).stream()
                     updates = {}
                     for c in courses:
@@ -599,16 +585,13 @@ def student_dashboard():
             
             rows = []
             for c, s in structured.items():
-                t = s.get('total',0)
-                a = s.get('attended',0)
+                t = s.get('total',0); a = s.get('attended',0)
                 p = 100.0 if t==0 else (a/t*100)
                 rows.append({"Subject":c, "Classes":f"{a}/{t}", "Percentage":p})
             
             if rows:
                 df = pd.DataFrame(rows)
                 st.metric("Average", f"{df['Percentage'].mean():.1f}%")
-                
-                # COMPACT CHART (Height 250)
                 c = alt.Chart(df).mark_bar(size=30).encode(
                     x=alt.X('Subject', sort='-y'), 
                     y=alt.Y('Percentage', scale=alt.Scale(domain=[0, 100])),
@@ -616,12 +599,9 @@ def student_dashboard():
                     tooltip=['Subject', 'Percentage']
                 ).properties(height=250)
                 st.altair_chart(c, use_container_width=True)
-                
                 st.dataframe(df)
-            else:
-                st.info("No attendance data yet.")
-        except Exception as e:
-            st.error(f"Error fetching data: {e}")
+            else: st.info("No attendance data yet.")
+        except Exception as e: st.error(f"Error fetching data: {e}")
 
 def main():
     with st.sidebar:
@@ -645,7 +625,6 @@ def main():
                     st.session_state['auth_user'] = {"id":"admin", "name":"Admin", "role":"Admin"}
                     st.rerun()
                 
-                # Smart Search (3 Variations)
                 try:
                     v1 = uid.lower()
                     v2 = sanitize_key(uid)
@@ -654,16 +633,13 @@ def main():
                     target_doc = None
                     final_id = None
 
-                    # Check 1: Lowercase (Standard Email)
                     doc = db.collection('Users').document(v1).get()
                     if doc.exists: target_doc = doc; final_id = v1
                     
-                    # Check 2: Sanitized (Old format)
                     if not target_doc:
                         doc = db.collection('Users').document(v2).get()
                         if doc.exists: target_doc = doc; final_id = v2
 
-                    # Check 3: Raw Input
                     if not target_doc:
                         doc = db.collection('Users').document(v3).get()
                         if doc.exists: target_doc = doc; final_id = v3
@@ -674,20 +650,15 @@ def main():
                             st.session_state['auth_user'] = {**user_data, "id": final_id}
                             st.success("Login Successful!")
                             st.rerun()
-                        else:
-                            st.error("❌ Incorrect Password")
-                    else:
-                        st.error(f"❌ User ID not found.")
-                        
-                except Exception as e: 
-                    st.error(f"System Error: {e}")
+                        else: st.error("❌ Incorrect Password")
+                    else: st.error(f"❌ User ID not found.")
+                except Exception as e: st.error(f"System Error: {e}")
 
     user = st.session_state.get('auth_user')
     if user:
         if user['role'] == "Admin": admin_dashboard()
         elif user['role'] == "Faculty": faculty_dashboard(user)
-    else: 
-        student_dashboard()
+    else: student_dashboard()
 
 if __name__ == "__main__":
     main()
