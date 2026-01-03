@@ -27,6 +27,7 @@ if not firebase_admin._apps:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
         else:
+            # Ensure you have this file in your folder
             cred = credentials.Certificate("firebase_key.json")
         firebase_admin.initialize_app(cred)
     except Exception as e:
@@ -61,10 +62,12 @@ def get_faculty_courses(faculty_id):
 # ==========================================
 
 def sanitize_key(val):
+    """Used for USNs and Course Codes (Uppercase, no dots)"""
     if not val: return ""
     return str(val).strip().upper().replace(".", "_").replace("/", "_").replace(" ", "")
 
 def generate_email(name, existing_email=None):
+    """Generates standard emails (Lowercase, dots allowed)"""
     val = str(existing_email).strip().lower()
     if val and val not in ['nan', 'none', '']:
         return val
@@ -165,16 +168,13 @@ def generate_student_summary_report(dept, sem, section):
 
     if raw_data:
         df = pd.DataFrame(raw_data)
-        # Reorder columns: Info first, then Subjects alphabetically
         base_cols = ["AY", "Dept", "Sem", "Section", "USN", "Name"]
         subj_cols = sorted(list(all_subjects))
         
-        # Ensure all columns exist (fill NaN with 0 for missing subjs)
         for sc in subj_cols:
             if sc not in df.columns: df[sc] = 0.0
             
         final_cols = base_cols + subj_cols
-        # Use simple sort
         return df[final_cols].sort_values(by="USN").fillna(0)
         
     return pd.DataFrame()
@@ -207,6 +207,7 @@ def process_courses_csv(df):
             "subcode": subcode, "subtitle": str(row.get('subtitle', subcode)),
             "faculty_id": femail, "faculty_name": fname
         })
+        # Important: Ensure email is key
         batch.set(db.collection('Users').document(femail), {
             "name": fname, "role": "Faculty", "dept": dept, "password": "password123"
         }, merge=True)
@@ -540,31 +541,81 @@ def student_dashboard():
 def main():
     with st.sidebar:
         st.title("🔐 Login")
+        
+        # Check if already logged in
         if st.session_state['auth_user']:
             st.success(f"User: {st.session_state['auth_user']['name']}")
-            if st.button("Logout"): st.session_state['auth_user'] = None; st.rerun()
+            st.info(f"ID: {st.session_state['auth_user']['id']}")
+            if st.button("Logout"): 
+                st.session_state['auth_user'] = None
+                st.rerun()
         else:
+            # Login Form
             uid = st.text_input("Email/ID").strip()
-            pwd = st.text_input("Password", type="password")
+            pwd = st.text_input("Password", type="password").strip()
+            
             if st.button("Sign In"):
-                if not uid: st.warning("Enter ID"); return
+                if not uid: 
+                    st.warning("Please enter your ID/Email")
+                    return
+                
+                # 1. Admin Login (Hardcoded)
                 if uid == "admin" and pwd == "admin123":
                     st.session_state['auth_user'] = {"id":"admin", "name":"Admin", "role":"Admin"}
                     st.rerun()
-                else:
-                    try:
-                        doc = db.collection('Users').document(sanitize_key(uid)).get()
-                        if doc.exists and doc.to_dict().get('password') == pwd:
-                            st.session_state['auth_user'] = {**doc.to_dict(), "id": sanitize_key(uid)}
-                            st.rerun()
-                        else: st.error("Invalid Login")
-                    except Exception as e: st.error(f"Error: {e}")
+                
+                # 2. Database Login (Smart Search - Try 3 variations)
+                try:
+                    # Variation A: As typed (lowercase) -> e.g., "dr.aruna.r@amc.edu"
+                    v1 = uid.lower()
+                    # Variation B: Sanitized Key (Upper, no dots) -> e.g., "DR_ARUNA_R@AMC_EDU"
+                    v2 = sanitize_key(uid)
+                    # Variation C: As typed (Original)
+                    v3 = uid
 
+                    # Try finding the user with any of these keys
+                    target_doc = None
+                    final_id = None
+
+                    # Check V1
+                    doc = db.collection('Users').document(v1).get()
+                    if doc.exists: 
+                        target_doc = doc; final_id = v1
+                    
+                    # Check V2 (Fallback)
+                    if not target_doc:
+                        doc = db.collection('Users').document(v2).get()
+                        if doc.exists: 
+                            target_doc = doc; final_id = v2
+
+                    # Check V3 (Fallback)
+                    if not target_doc:
+                        doc = db.collection('Users').document(v3).get()
+                        if doc.exists: 
+                            target_doc = doc; final_id = v3
+
+                    # Validate Password
+                    if target_doc:
+                        user_data = target_doc.to_dict()
+                        if user_data.get('password') == pwd:
+                            st.session_state['auth_user'] = {**user_data, "id": final_id}
+                            st.success("Login Successful!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Incorrect Password")
+                    else:
+                        st.error(f"❌ User ID not found.")
+                        
+                except Exception as e: 
+                    st.error(f"System Error: {e}")
+
+    # Routing based on Role
     user = st.session_state.get('auth_user')
     if user:
         if user['role'] == "Admin": admin_dashboard()
         elif user['role'] == "Faculty": faculty_dashboard(user)
-    else: student_dashboard()
+    else: 
+        student_dashboard()
 
 if __name__ == "__main__":
     main()
