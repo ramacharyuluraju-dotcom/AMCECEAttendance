@@ -21,10 +21,8 @@ if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
 
 # Initialize Firebase
-# (Safe check to prevent re-initialization error on reload)
 if not firebase_admin._apps:
     try:
-        # Check for Streamlit Secrets or use local file
         if "firebase" in st.secrets:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
@@ -42,7 +40,6 @@ db = firestore.client()
 
 @st.cache_data(ttl=60) 
 def get_students_cached(dept, sem, section):
-    """Fetches student list. Cached for speed."""
     c_dept = str(dept).strip().upper()
     c_sem = str(sem).strip()
     c_sec = str(section).strip().upper()
@@ -54,7 +51,7 @@ def get_students_cached(dept, sem, section):
     
     return [{"usn": d.id, **d.to_dict()} for d in docs]
 
-@st.cache_data(ttl=10) # Low cache to see reassignments quickly
+@st.cache_data(ttl=10) 
 def get_faculty_courses(faculty_id):
     docs = db.collection('Courses').where("faculty_id", "==", faculty_id).stream()
     return [d.to_dict() for d in docs]
@@ -113,12 +110,11 @@ def generate_session_report(dept, start_date, end_date):
     return pd.DataFrame(data)
 
 def generate_student_summary_report(dept, sem, section):
-    """VTU Detention Report (Includes students with 0 attendance)"""
+    """VTU Detention Report"""
     students = get_students_cached(dept, sem, section)
     if not students: return pd.DataFrame()
     
     report_data = []
-    
     for s in students:
         usn = s['usn']
         name = s.get('name', 'Unknown')
@@ -138,7 +134,6 @@ def generate_student_summary_report(dept, sem, section):
                 elif isinstance(v, dict):
                     structured[k] = v
         
-        # If no summary, force fill with course list (0/0)
         if not structured:
             courses = db.collection('Courses').where("dept", "==", dept)\
                 .where("sem", "==", sem).where("section", "==", section).stream()
@@ -278,14 +273,14 @@ def admin_force_sync():
 def render_report_tab():
     st.subheader("1. 🎓 VTU Shortage/Detention List")
     c1, c2, c3 = st.columns(3)
-    s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0)
-    s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2)
-    s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0)
+    # KEY FIX: Added keys (key='rep_dept', etc) to prevent duplicates
+    s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key='rep_dept')
+    s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key='rep_sem')
+    s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key='rep_sec')
     
     if st.button("Generate Detention List"):
         with st.spinner("Processing..."):
             df = generate_student_summary_report(s_dept, s_sem, s_sec)
-        
         if not df.empty:
             st.dataframe(df)
             st.download_button("⬇️ CSV", df.to_csv(index=False).encode('utf-8'), "VTU_List.csv")
@@ -299,7 +294,7 @@ def render_report_tab():
     l_end = c2.date_input("To Date", datetime.date.today())
     
     if st.button("Generate Class Logs"):
-        df = generate_session_report(s_dept, l_start, l_end) # reusing dept from above
+        df = generate_session_report(s_dept, l_start, l_end)
         if not df.empty:
             st.dataframe(df)
             st.download_button("⬇️ Logs CSV", df.to_csv(index=False).encode('utf-8'), "class_logs.csv")
@@ -417,7 +412,8 @@ def admin_dashboard():
                     st.success("Created")
         
         with tab_manage:
-            sel_dept = st.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"])
+            # KEY FIX: Added key='fac_dept' to avoid collision with Report tab
+            sel_dept = st.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], key='fac_dept')
             facs = list(db.collection('Users').where("role", "==", "Faculty").where("dept", "==", sel_dept).stream())
             if facs:
                 f_map = {f.to_dict()['name']: f.id for f in facs}
@@ -441,7 +437,8 @@ def admin_dashboard():
         st.subheader("Manage Students")
         ts, ta = st.tabs(["Search", "Add Manual"])
         with ts:
-            s_in = st.text_input("USN").strip().upper()
+            # KEY FIX: Added key to search
+            s_in = st.text_input("USN", key="search_usn").strip().upper()
             if s_in:
                 doc = db.collection('Students').document(s_in).get()
                 if doc.exists:
@@ -471,7 +468,8 @@ def admin_dashboard():
 def student_dashboard():
     st.markdown("<h1 style='text-align: center;'>🎓 Student Portal</h1>", unsafe_allow_html=True)
     c2 = st.columns([1,2,1])[1]
-    usn = c2.text_input("Enter USN").strip().upper()
+    # KEY FIX: Added key
+    usn = c2.text_input("Enter USN", key='std_portal_usn').strip().upper()
     if c2.button("Check Attendance") and usn:
         doc = db.collection('Student_Summaries').document(usn).get()
         if not doc.exists: st.error("USN Not Found"); return
