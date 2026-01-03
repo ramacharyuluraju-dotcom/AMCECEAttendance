@@ -288,35 +288,36 @@ def admin_force_sync():
 # 6. DASHBOARDS
 # ==========================================
 
-def render_report_tab():
+def render_report_tab(prefix=""):
     st.subheader("1. 🎓 Consolidated Detention/Attendance Report")
     c1, c2, c3 = st.columns(3)
-    s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key='rep_dept')
-    s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key='rep_sem')
-    s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key='rep_sec')
+    s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key=f'{prefix}rep_dept')
+    s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key=f'{prefix}rep_sem')
+    s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key=f'{prefix}rep_sec')
     
-    if st.button("Generate Consolidated Report"):
+    if st.button("Generate Consolidated Report", key=f'{prefix}btn_cons'):
         with st.spinner("Processing..."):
             df = generate_student_summary_report(s_dept, s_sem, s_sec)
         
         if not df.empty:
             st.success(f"Generated report for {len(df)} students.")
             st.dataframe(df)
-            st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode('utf-8'), "Consolidated_Attendance.csv")
+            st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode('utf-8'), "Consolidated_Attendance.csv", key=f'{prefix}dl_cons')
         else:
             st.warning("No data found for this class.")
 
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
     c1, c2 = st.columns(2)
-    l_start = c1.date_input("From Date", datetime.date.today().replace(day=1))
-    l_end = c2.date_input("To Date", datetime.date.today())
+    # FIXED: Added unique keys to date_inputs to prevent tab jumping
+    l_start = c1.date_input("From Date", datetime.date.today().replace(day=1), key=f'{prefix}rep_start_date')
+    l_end = c2.date_input("To Date", datetime.date.today(), key=f'{prefix}rep_end_date')
     
-    if st.button("Generate Class Logs"):
+    if st.button("Generate Class Logs", key=f'{prefix}btn_logs'):
         df = generate_session_report(s_dept, l_start, l_end)
         if not df.empty:
             st.dataframe(df)
-            st.download_button("⬇️ Logs CSV", df.to_csv(index=False).encode('utf-8'), "class_logs.csv")
+            st.download_button("⬇️ Logs CSV", df.to_csv(index=False).encode('utf-8'), "class_logs.csv", key=f'{prefix}dl_logs')
         else:
             st.warning("No classes found.")
 
@@ -337,15 +338,15 @@ def faculty_dashboard(user):
             st.caption(f"Marking: {course['subtitle']} | {course['dept']} {course['sem']}-{course['section']}")
             
             c_date, c_period = st.columns(2)
-            date_val = c_date.date_input("Date", datetime.date.today())
-            period_val = c_period.selectbox("Period", ["1", "2", "3", "4", "5", "6", "7", "Lab"])
+            date_val = c_date.date_input("Date", datetime.date.today(), key='mark_date')
+            period_val = c_period.selectbox("Period", ["1", "2", "3", "4", "5", "6", "7", "Lab"], key='mark_period')
             
             session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
             already_marked = db.collection('Class_Sessions').document(session_id).get().exists
             
             if already_marked:
                 st.error("⚠️ Already marked.")
-                if not st.checkbox("Unlock to Overwrite?"): st.stop()
+                if not st.checkbox("Unlock to Overwrite?", key='unlock_mark'): st.stop()
             
             s_list = sorted(get_students_cached(course['dept'], course['sem'], course['section']), key=lambda x: x['usn'])
             
@@ -408,7 +409,8 @@ def faculty_dashboard(user):
         else:
             st.info("No history found.")
     with t3:
-        render_report_tab()
+        # FIXED: Pass prefix to ensure unique keys
+        render_report_tab(prefix="fac_")
 
 def admin_dashboard():
     st.title("⚙️ Admin Dashboard")
@@ -433,7 +435,8 @@ def admin_dashboard():
             st.success(f"Synced {n} students.")
 
     with t3:
-        render_report_tab()
+        # FIXED: Pass prefix to ensure unique keys
+        render_report_tab(prefix="adm_")
 
     with t4:
         st.subheader("Manage Faculty")
@@ -498,7 +501,7 @@ def admin_dashboard():
                 if doc.exists:
                     d = doc.to_dict()
                     st.markdown("---")
-                    # FIX: Reduced Font Sizes for better look
+                    # FIXED: Smaller fonts for Admin View
                     st.subheader(f"👤 {d.get('name', 'N/A')}")
                     st.caption(f"USN: {s_in}")
                     
@@ -557,14 +560,14 @@ def student_dashboard():
             df = pd.DataFrame(rows)
             st.metric("Average", f"{df['Percentage'].mean():.1f}%")
             
-            # FIX: Made chart compact and standard size (height=250)
+            # FIXED: Compact chart height and size
             c = alt.Chart(df).mark_bar(size=30).encode(
                 x=alt.X('Subject', sort='-y'), 
                 y=alt.Y('Percentage', scale=alt.Scale(domain=[0, 100])),
                 color=alt.condition(alt.datum.Percentage < 75, alt.value('#FF4B4B'), alt.value('#00CC96')),
                 tooltip=['Subject', 'Percentage']
             ).properties(
-                height=250  # Fixed height so it's not huge
+                height=250 
             )
             st.altair_chart(c, use_container_width=True)
             
