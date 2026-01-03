@@ -72,22 +72,27 @@ def generate_email(name, existing_email=None):
     return f"{clean_name}@amc.edu"
 
 # ==========================================
-# 4. REPORT GENERATOR (NEW)
+# 4. REPORT GENERATOR (FIXED SEMESTER)
 # ==========================================
 
 def generate_session_report(dept, start_date, end_date):
-    """Generates a dataframe of all class sessions for a specific Dept and Date Range."""
+    """Generates a detailed report with Semester lookup."""
     
-    # 1. Fetch all courses to map SubCode -> Dept
-    # (Class_Sessions doesn't store Dept, so we look it up from Courses)
+    # 1. Fetch Course Info (To map SubCode -> Sem/Title)
     all_courses = db.collection('Courses').stream()
-    course_dept_map = {}
+    course_lookup = {}
+    
     for c in all_courses:
         d = c.to_dict()
-        course_dept_map[d['subcode']] = d.get('dept', 'UNKNOWN')
+        # Only cache info for the requested Department
+        # This handles shared subjects (e.g. Maths) correctly for the specific Dept
+        if d.get('dept') == dept:
+            course_lookup[d['subcode']] = {
+                'sem': d.get('sem', 'N/A'),
+                'title': d.get('subtitle', '')
+            }
 
-    # 2. Query Sessions by Date Range
-    # Firestore requires string comparison for dates stored as strings
+    # 2. Query Sessions by Date
     sessions = db.collection('Class_Sessions')\
         .where("date", ">=", str(start_date))\
         .where("date", "<=", str(end_date))\
@@ -98,22 +103,21 @@ def generate_session_report(dept, start_date, end_date):
         d = s.to_dict()
         subcode = d.get('course_code', '')
         
-        # 3. Filter by Department
-        # Only include if the course belongs to the requested Dept
-        if course_dept_map.get(subcode) == dept:
-            absent_count = len(d.get('absentees', []))
-            # We don't store total strength in session, so we estimate Present
-            # or just report Absentees.
+        # 3. Filter & Enrich
+        # Only include if this subject belongs to the requested Dept
+        if subcode in course_lookup:
+            info = course_lookup[subcode]
             
             data.append({
                 "Date": d.get('date'),
                 "Period": d.get('period', 'N/A'),
                 "Dept": dept,
-                "Sem": "N/A", # Difficult to get without expensive lookups
+                "Sem": info['sem'], # <--- NOW POPULATED
                 "Section": d.get('section'),
                 "Subject Code": subcode,
+                "Subject Title": info['title'],
                 "Faculty Name": d.get('faculty_name'),
-                "Absentees Count": absent_count,
+                "Absentees Count": len(d.get('absentees', [])),
                 "Absent USNs": ", ".join(d.get('absentees', []))
             })
             
@@ -418,7 +422,6 @@ def student_dashboard():
             
             data = doc.to_dict()
             
-            # --- CRITICAL FIX: UN-FLATTEN THE DATA ---
             structured_data = {}
             for k, v in data.items():
                 if "." in k:
@@ -545,7 +548,6 @@ def admin_dashboard():
                 st.success(f"Found {len(df)} sessions.")
                 st.dataframe(df, use_container_width=True)
                 
-                # Convert to CSV
                 csv = df.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     "⬇️ Download CSV",
