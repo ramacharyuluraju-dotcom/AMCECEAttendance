@@ -110,55 +110,73 @@ def generate_session_report(dept, start_date, end_date):
     return pd.DataFrame(data)
 
 def generate_student_summary_report(dept, sem, section):
-    """VTU Detention Report"""
+    """Generates a Consolidated Student-wise Report (Pivot Table)"""
     students = get_students_cached(dept, sem, section)
     if not students: return pd.DataFrame()
     
-    report_data = []
+    raw_data = []
+    all_subjects = set()
+    
     for s in students:
         usn = s['usn']
         name = s.get('name', 'Unknown')
-        ay = s.get('ay', '2025_26')
         
         doc = db.collection('Student_Summaries').document(usn).get()
         structured = {}
         
+        # Parse Firestore Data
         if doc.exists:
-            raw_data = doc.to_dict()
-            for k, v in raw_data.items():
+            data = doc.to_dict()
+            for k, v in data.items():
                 if "." in k:
-                    parts = k.split('.')
-                    code, field = parts[0], parts[1]
-                    if code not in structured: structured[code] = {}
-                    structured[code][field] = v
-                elif isinstance(v, dict):
-                    structured[k] = v
+                    try:
+                        code, field = k.split('.')[0], k.split('.')[1]
+                        if code not in structured: structured[code] = {}
+                        structured[code][field] = v
+                    except: pass
         
+        # Calculate stats per subject
+        student_row = {
+            "AY": s.get('ay', '2025_26'),
+            "Dept": dept,
+            "Sem": sem, 
+            "Section": section,
+            "USN": usn, 
+            "Name": name
+        }
+        
+        # If no attendance data exists, fill 0 for known courses
         if not structured:
             courses = db.collection('Courses').where("dept", "==", dept)\
                 .where("sem", "==", sem).where("section", "==", section).stream()
             for c in courses:
-                cd = c.to_dict(); sc = sanitize_key(cd['subcode'])
-                structured[sc] = {'title': cd['subtitle'], 'total': 0, 'attended': 0}
+                sc = sanitize_key(c.to_dict()['subcode'])
+                student_row[sc] = 0.0
+                all_subjects.add(sc)
+        else:
+            for code, stats in structured.items():
+                tot = stats.get('total', 0)
+                att = stats.get('attended', 0)
+                pct = 100.0 if tot == 0 else round((att / tot * 100), 1)
+                student_row[code] = pct
+                all_subjects.add(code)
+        
+        raw_data.append(student_row)
 
-        for code, stats in structured.items():
-            tot = stats.get('total', 0)
-            att = stats.get('attended', 0)
-            absent = tot - att
-            pct = 100.0 if tot == 0 else (att / tot * 100)
-            status = "Safe" if pct >= 85 else ("Warning" if pct >= 75 else "Critical")
+    if raw_data:
+        df = pd.DataFrame(raw_data)
+        # Reorder columns: Info first, then Subjects alphabetically
+        base_cols = ["AY", "Dept", "Sem", "Section", "USN", "Name"]
+        subj_cols = sorted(list(all_subjects))
+        
+        # Ensure all columns exist (fill NaN with 0 for missing subjs)
+        for sc in subj_cols:
+            if sc not in df.columns: df[sc] = 0.0
             
-            report_data.append({
-                "AY": ay, "Dept": dept, "Sem": sem, "Section": section,
-                "USN": usn, "Name": name, 
-                "Subject Code": code, "Subject Title": stats.get('title', code),
-                "Total Classes": tot, "Classes Attended": att,
-                "Classes Absent": absent, "Percentage": round(pct, 2), 
-                "Status": status
-            })
-                
-    if report_data:
-        return pd.DataFrame(report_data).sort_values(by=['USN', 'Subject Code'])
+        final_cols = base_cols + subj_cols
+        # Use simple sort
+        return df[final_cols].sort_values(by="USN").fillna(0)
+        
     return pd.DataFrame()
 
 # ==========================================
@@ -271,21 +289,22 @@ def admin_force_sync():
 # ==========================================
 
 def render_report_tab():
-    st.subheader("1. 🎓 VTU Shortage/Detention List")
+    st.subheader("1. 🎓 Consolidated Detention/Attendance Report")
     c1, c2, c3 = st.columns(3)
-    # KEY FIX: Added keys (key='rep_dept', etc) to prevent duplicates
     s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key='rep_dept')
     s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key='rep_sem')
     s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key='rep_sec')
     
-    if st.button("Generate Detention List"):
+    if st.button("Generate Consolidated Report"):
         with st.spinner("Processing..."):
             df = generate_student_summary_report(s_dept, s_sem, s_sec)
+        
         if not df.empty:
+            st.success(f"Generated report for {len(df)} students.")
             st.dataframe(df)
-            st.download_button("⬇️ CSV", df.to_csv(index=False).encode('utf-8'), "VTU_List.csv")
+            st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode('utf-8'), "Consolidated_Attendance.csv")
         else:
-            st.warning("No data found.")
+            st.warning("No data found for this class.")
 
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
@@ -412,7 +431,6 @@ def admin_dashboard():
                     st.success("Created")
         
         with tab_manage:
-            # KEY FIX: Added key='fac_dept' to avoid collision with Report tab
             sel_dept = st.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], key='fac_dept')
             facs = list(db.collection('Users').where("role", "==", "Faculty").where("dept", "==", sel_dept).stream())
             if facs:
@@ -435,19 +453,36 @@ def admin_dashboard():
 
     with t5:
         st.subheader("Manage Students")
-        ts, ta = st.tabs(["Search", "Add Manual"])
+        ts, ta = st.tabs(["🔍 Search & Edit", "➕ Add Manual"])
         with ts:
-            # KEY FIX: Added key to search
-            s_in = st.text_input("USN", key="search_usn").strip().upper()
+            s_in = st.text_input("Enter USN to Search", key="search_usn").strip().upper()
             if s_in:
                 doc = db.collection('Students').document(s_in).get()
                 if doc.exists:
-                    st.write(doc.to_dict())
-                    if st.button("Delete"):
-                        db.collection('Students').document(s_in).delete()
-                        db.collection('Student_Summaries').document(s_in).delete()
-                        st.success("Deleted"); st.rerun()
-                else: st.warning("Not found.")
+                    d = doc.to_dict()
+                    st.markdown("### 👤 Student Details")
+                    with st.container(border=True):
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Name", d.get('name', 'N/A'))
+                        c2.metric("Dept", d.get('dept', 'N/A'))
+                        c3.metric("USN", s_in)
+                        
+                        c4, c5, c6 = st.columns(3)
+                        c4.write(f"**Sem:** {d.get('sem', '-')}")
+                        c5.write(f"**Section:** {d.get('section', '-')}")
+                        c6.write(f"**Batch:** {d.get('batch', '-')}")
+
+                    st.write("")
+                    with st.expander("⚠️ Danger Zone (Delete Student)"):
+                        st.warning("Action cannot be undone. Deletes student AND attendance stats.")
+                        if st.checkbox(f"I confirm I want to delete {s_in}"):
+                            if st.button("🗑️ Permanently Delete"):
+                                db.collection('Students').document(s_in).delete()
+                                db.collection('Student_Summaries').document(s_in).delete()
+                                st.success("Student Deleted Successfully.")
+                                st.rerun()
+                else:
+                    st.warning("Student not found.")
         with ta:
             with st.form("manual_stu"):
                 m_usn = st.text_input("USN").upper(); m_name = st.text_input("Name")
@@ -468,7 +503,6 @@ def admin_dashboard():
 def student_dashboard():
     st.markdown("<h1 style='text-align: center;'>🎓 Student Portal</h1>", unsafe_allow_html=True)
     c2 = st.columns([1,2,1])[1]
-    # KEY FIX: Added key
     usn = c2.text_input("Enter USN", key='std_portal_usn').strip().upper()
     if c2.button("Check Attendance") and usn:
         doc = db.collection('Student_Summaries').document(usn).get()
