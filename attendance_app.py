@@ -5,6 +5,7 @@ from firebase_admin import credentials, firestore
 import datetime
 import altair as alt
 import re
+import io
 
 # ==========================================
 # 1. SETUP & CONFIGURATION
@@ -37,7 +38,6 @@ db = firestore.client()
 @st.cache_data(ttl=3600)
 def get_students_cached(dept, sem, section):
     """Fetches student list from DB."""
-    # Ensure inputs are clean before querying
     c_dept = str(dept).strip().upper()
     c_sem = str(sem).strip()
     c_sec = str(section).strip().upper()
@@ -61,7 +61,6 @@ def get_faculty_courses(faculty_id):
 
 def sanitize_key(val):
     if not val: return ""
-    # Replace dots/slashes/spaces with underscore
     return str(val).strip().upper().replace(".", "_").replace("/", "_").replace(" ", "")
 
 def generate_email(name, existing_email=None):
@@ -73,7 +72,55 @@ def generate_email(name, existing_email=None):
     return f"{clean_name}@amc.edu"
 
 # ==========================================
-# 4. BATCH PROCESSING (CSV)
+# 4. REPORT GENERATOR (NEW)
+# ==========================================
+
+def generate_session_report(dept, start_date, end_date):
+    """Generates a dataframe of all class sessions for a specific Dept and Date Range."""
+    
+    # 1. Fetch all courses to map SubCode -> Dept
+    # (Class_Sessions doesn't store Dept, so we look it up from Courses)
+    all_courses = db.collection('Courses').stream()
+    course_dept_map = {}
+    for c in all_courses:
+        d = c.to_dict()
+        course_dept_map[d['subcode']] = d.get('dept', 'UNKNOWN')
+
+    # 2. Query Sessions by Date Range
+    # Firestore requires string comparison for dates stored as strings
+    sessions = db.collection('Class_Sessions')\
+        .where("date", ">=", str(start_date))\
+        .where("date", "<=", str(end_date))\
+        .stream()
+        
+    data = []
+    for s in sessions:
+        d = s.to_dict()
+        subcode = d.get('course_code', '')
+        
+        # 3. Filter by Department
+        # Only include if the course belongs to the requested Dept
+        if course_dept_map.get(subcode) == dept:
+            absent_count = len(d.get('absentees', []))
+            # We don't store total strength in session, so we estimate Present
+            # or just report Absentees.
+            
+            data.append({
+                "Date": d.get('date'),
+                "Period": d.get('period', 'N/A'),
+                "Dept": dept,
+                "Sem": "N/A", # Difficult to get without expensive lookups
+                "Section": d.get('section'),
+                "Subject Code": subcode,
+                "Faculty Name": d.get('faculty_name'),
+                "Absentees Count": absent_count,
+                "Absent USNs": ", ".join(d.get('absentees', []))
+            })
+            
+    return pd.DataFrame(data)
+
+# ==========================================
+# 5. BATCH PROCESSING (CSV)
 # ==========================================
 
 def process_courses_csv(df):
@@ -143,7 +190,6 @@ def process_students_csv(df):
     batch = db.batch()
     count = 0
     
-    # Cache Map
     course_map = {}
     all_courses = db.collection('Courses').stream()
     for c in all_courses:
@@ -168,7 +214,6 @@ def process_students_csv(df):
             "ay": ay, "batch": str(row.get('batch', ''))
         })
         
-        # Initial Link
         class_key = f"{dept}_{sem}_{sec}"
         if class_key in course_map:
             summ_ref = db.collection('Student_Summaries').document(usn)
@@ -189,15 +234,13 @@ def process_students_csv(df):
     return count
 
 def admin_force_sync():
-    """SMART SYNC: Normalizes keys and links subjects."""
+    """SMART SYNC"""
     students = db.collection('Students').stream()
     courses = list(db.collection('Courses').stream())
     
-    # 1. Build Robust Course Map
     course_map = {}
     for c in courses:
         d = c.to_dict()
-        # Ensure Key is normalized: ECE_3_A (no spaces)
         k = f"{str(d['dept']).strip().upper()}_{str(d['sem']).strip()}_{str(d['section']).strip().upper()}"
         if k not in course_map: course_map[k] = []
         course_map[k].append(d)
@@ -210,7 +253,6 @@ def admin_force_sync():
         s_data = s.to_dict()
         usn = s.id
         
-        # 2. Normalize Student Data to match Key
         s_dept = str(s_data.get('dept', '')).strip().upper()
         s_sem = str(s_data.get('sem', '')).strip()
         s_sec = str(s_data.get('section', '')).strip().upper()
@@ -223,7 +265,6 @@ def admin_force_sync():
             for c in course_map[k]:
                 code = sanitize_key(c['subcode'])
                 updates[f"{code}.title"] = c['subtitle']
-                # Safe initialization (keeps existing value if present)
                 updates[f"{code}.total"] = firestore.Increment(0)
                 updates[f"{code}.attended"] = firestore.Increment(0)
             
@@ -239,7 +280,7 @@ def admin_force_sync():
     return updated
 
 # ==========================================
-# 5. DASHBOARDS
+# 6. DASHBOARDS
 # ==========================================
 
 def faculty_dashboard(user):
@@ -260,12 +301,10 @@ def faculty_dashboard(user):
     with t1:
         st.subheader(f"{course['subcode']} - {course['subtitle']}")
         
-        # TIME SLOT
         c_date, c_period = st.columns(2)
         date_val = c_date.date_input("Date", datetime.date.today())
         period_val = c_period.selectbox("Period / Hour", ["1st Hour", "2nd Hour", "3rd Hour", "4th Hour", "5th Hour", "6th Hour", "7th Hour", "Lab Session"])
         
-        # DUPLICATE CHECK
         session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
         existing_doc = db.collection('Class_Sessions').document(session_id).get()
         already_marked = existing_doc.exists
@@ -325,7 +364,6 @@ def faculty_dashboard(user):
                     sub_key = sanitize_key(course['subcode'])
                     for s in s_list:
                         summ_ref = db.collection('Student_Summaries').document(s['usn'])
-                        # Writing Flat Keys (Consistent with DB)
                         batch.set(summ_ref, {
                             f"{sub_key}.title": course['subtitle'],
                             f"{sub_key}.total": firestore.Increment(1)
@@ -343,7 +381,6 @@ def faculty_dashboard(user):
     with t2:
         logs = list(db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream())
         
-        # Robust History Display
         data = []
         for l in logs:
             d = l.to_dict()
@@ -382,11 +419,9 @@ def student_dashboard():
             data = doc.to_dict()
             
             # --- CRITICAL FIX: UN-FLATTEN THE DATA ---
-            # Your DB has 'BEC501.total': 0. This loop converts it to structure.
             structured_data = {}
             for k, v in data.items():
                 if "." in k:
-                    # Handle keys like 'BEC501.total'
                     parts = k.split('.')
                     if len(parts) >= 2:
                         code = parts[0]
@@ -394,7 +429,6 @@ def student_dashboard():
                         if code not in structured_data: structured_data[code] = {}
                         structured_data[code][field] = v
                 else:
-                    # Handle keys that are already nested (if any)
                     if isinstance(v, dict):
                         structured_data[k] = v
 
@@ -434,12 +468,11 @@ def student_dashboard():
                 st.dataframe(df[['Subject', 'Title', 'Classes', 'Percentage', 'Status']], use_container_width=True)
             else:
                 st.warning("No subject data linked.")
-                st.info(f"Debug: Found profile for {usn}, but no subjects linked. Ask Admin to run 'Sync/Fix' tool.")
 
 def admin_dashboard():
     st.title("⚙️ Admin Dashboard")
     
-    t1, t2, t3, t4 = st.tabs(["📤 Uploads", "🔧 Tools & Debug", "👨‍🏫 Faculty", "🎓 Students"])
+    t1, t2, t3, t4, t5 = st.tabs(["📤 Uploads", "🔧 Tools & Debug", "📊 Reports", "👨‍🏫 Faculty", "🎓 Students"])
     
     with t1:
         c1, c2 = st.columns(2)
@@ -494,13 +527,41 @@ def admin_dashboard():
                     st.write("**Current Linked Subjects:**", sum_doc.to_dict())
                 else:
                     st.error("No Summary Document found (Not Linked).")
-
+    
     with t3:
+        st.header("📊 Attendance Reports")
+        st.info("Download session logs for specific dates and departments.")
+        
+        c_dept, c_d1, c_d2 = st.columns(3)
+        r_dept = c_dept.text_input("Department Filter", "ECE").strip().upper()
+        r_start = c_d1.date_input("Start Date", datetime.date.today().replace(day=1))
+        r_end = c_d2.date_input("End Date", datetime.date.today())
+        
+        if st.button("Generate Report"):
+            with st.spinner("Fetching data..."):
+                df = generate_session_report(r_dept, r_start, r_end)
+            
+            if not df.empty:
+                st.success(f"Found {len(df)} sessions.")
+                st.dataframe(df, use_container_width=True)
+                
+                # Convert to CSV
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "⬇️ Download CSV",
+                    csv,
+                    f"attendance_{r_dept}_{r_start}_to_{r_end}.csv",
+                    "text/csv"
+                )
+            else:
+                st.warning("No sessions found for this criteria.")
+
+    with t4:
         if st.button("Load Faculty"):
             docs = db.collection('Users').where("role", "==", "Faculty").stream()
             st.dataframe(pd.DataFrame([d.to_dict() for d in docs]))
 
-    with t4:
+    with t5:
         c1, c2, c3 = st.columns(3)
         dept = c1.text_input("Dept", "ECE")
         sem = c2.text_input("Sem", "3")
@@ -510,7 +571,7 @@ def admin_dashboard():
             get_students_cached.clear()
 
 # ==========================================
-# 6. MAIN
+# 7. MAIN
 # ==========================================
 
 def main():
