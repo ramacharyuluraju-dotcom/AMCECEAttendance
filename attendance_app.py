@@ -27,7 +27,6 @@ if not firebase_admin._apps:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
         else:
-            # Ensure you have this file in your folder
             cred = credentials.Certificate("firebase_key.json")
         firebase_admin.initialize_app(cred)
     except Exception as e:
@@ -127,7 +126,6 @@ def generate_student_summary_report(dept, sem, section):
         doc = db.collection('Student_Summaries').document(usn).get()
         structured = {}
         
-        # Parse Firestore Data
         if doc.exists:
             data = doc.to_dict()
             for k, v in data.items():
@@ -138,7 +136,6 @@ def generate_student_summary_report(dept, sem, section):
                         structured[code][field] = v
                     except: pass
         
-        # Calculate stats per subject
         student_row = {
             "AY": s.get('ay', '2025_26'),
             "Dept": dept,
@@ -148,7 +145,6 @@ def generate_student_summary_report(dept, sem, section):
             "Name": name
         }
         
-        # If no attendance data exists, fill 0 for known courses
         if not structured:
             courses = db.collection('Courses').where("dept", "==", dept)\
                 .where("sem", "==", sem).where("section", "==", section).stream()
@@ -207,7 +203,6 @@ def process_courses_csv(df):
             "subcode": subcode, "subtitle": str(row.get('subtitle', subcode)),
             "faculty_id": femail, "faculty_name": fname
         })
-        # Important: Ensure email is key
         batch.set(db.collection('Users').document(femail), {
             "name": fname, "role": "Faculty", "dept": dept, "password": "password123"
         }, merge=True)
@@ -378,7 +373,11 @@ def faculty_dashboard(user):
                             st.warning("Log updated. Stats not incremented.")
                         batch.commit()
     with t2:
-        logs = list(db.collection('Class_Sessions').where("faculty_id", "==", user['id']).order_by("date", "DESCENDING").stream())
+        # FIX: Removed server-side sort to prevent index crash
+        logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream()
+        # Sort in Python instead
+        logs = sorted([l for l in logs_stream], key=lambda x: x.to_dict().get('date', ''), reverse=True)
+        
         if logs:
             data = []
             for l in logs:
@@ -431,7 +430,6 @@ def admin_dashboard():
                 n_pass = c2.text_input("Password", type="password")
                 
                 if st.form_submit_button("Create"):
-                    # FIX: Force lowercase email for consistency
                     clean_email = n_email.strip().lower()
                     if clean_email:
                         db.collection('Users').document(clean_email).set({
@@ -459,7 +457,6 @@ def admin_dashboard():
                         with st.expander(f"{cd['subcode']} - {cd['subtitle']}"):
                             new_email = st.text_input("Reassign to (Email):", key=c.id)
                             if st.button("Update", key=f"btn_{c.id}"):
-                                # Fix: Ensure lowercase on reassignment
                                 db.collection('Courses').document(c.id).update({"faculty_id": new_email.strip().lower()})
                                 st.success("Reassigned")
                                 st.rerun()
@@ -470,22 +467,30 @@ def admin_dashboard():
         st.subheader("Manage Students")
         ts, ta = st.tabs(["🔍 Search & Edit", "➕ Add Manual"])
         with ts:
-            s_in = st.text_input("Enter USN to Search", key="search_usn").strip().upper()
+            # FIX: Layout for Search Button so it's not a "direct switch"
+            c_search, c_btn = st.columns([3, 1])
+            s_in_raw = c_search.text_input("Enter USN to Search", key="search_usn")
+            
+            # Button triggers search logic
+            if c_btn.button("🔍 Search", key='search_btn'):
+                st.session_state['admin_search_usn'] = s_in_raw.strip().upper()
+            
+            s_in = st.session_state.get('admin_search_usn', '')
+            
             if s_in:
                 doc = db.collection('Students').document(s_in).get()
                 if doc.exists:
                     d = doc.to_dict()
-                    st.markdown("### 👤 Student Details")
+                    st.markdown("---")
+                    # FIX: Better Fonts and Layout
+                    st.markdown(f"## 👤 {d.get('name', 'N/A')}")
+                    st.markdown(f"### ID: `{s_in}`")
+                    
                     with st.container(border=True):
                         c1, c2, c3 = st.columns(3)
-                        c1.metric("Name", d.get('name', 'N/A'))
-                        c2.metric("Dept", d.get('dept', 'N/A'))
-                        c3.metric("USN", s_in)
-                        
-                        c4, c5, c6 = st.columns(3)
-                        c4.write(f"**Sem:** {d.get('sem', '-')}")
-                        c5.write(f"**Section:** {d.get('section', '-')}")
-                        c6.write(f"**Batch:** {d.get('batch', '-')}")
+                        c1.metric("Dept", d.get('dept', 'N/A'))
+                        c2.metric("Sem", d.get('sem', '-'))
+                        c3.metric("Section", d.get('section', '-'))
 
                     st.write("")
                     with st.expander("⚠️ Danger Zone (Delete Student)"):
@@ -497,7 +502,7 @@ def admin_dashboard():
                                 st.success("Student Deleted Successfully.")
                                 st.rerun()
                 else:
-                    st.warning("Student not found.")
+                    st.warning(f"Student '{s_in}' not found.")
         with ta:
             with st.form("manual_stu"):
                 m_usn = st.text_input("USN").upper(); m_name = st.text_input("Name")
@@ -505,7 +510,6 @@ def admin_dashboard():
                 m_sec = st.text_input("Sec", "A").upper()
                 if st.form_submit_button("Add"):
                     db.collection('Students').document(m_usn).set({"name":m_name,"dept":m_dept,"sem":m_sem,"section":m_sec,"ay":"2025_26"})
-                    # Auto Link
                     courses = db.collection('Courses').where("dept", "==", m_dept).where("sem", "==", m_sem).where("section", "==", m_sec).stream()
                     updates = {}
                     for c in courses:
@@ -536,13 +540,21 @@ def student_dashboard():
         if rows:
             df = pd.DataFrame(rows)
             st.metric("Average", f"{df['Percentage'].mean():.1f}%")
+            
+            # FIX: Restored Graphic Representation (Altair Chart)
+            c = alt.Chart(df).mark_bar().encode(
+                x='Subject', 
+                y='Percentage',
+                color=alt.condition(alt.datum.Percentage < 75, alt.value('red'), alt.value('green')),
+                tooltip=['Subject', 'Percentage']
+            ).properties(height=300)
+            st.altair_chart(c, use_container_width=True)
+            
             st.dataframe(df)
 
 def main():
     with st.sidebar:
         st.title("🔐 Login")
-        
-        # Check if already logged in
         if st.session_state['auth_user']:
             st.success(f"User: {st.session_state['auth_user']['name']}")
             st.info(f"ID: {st.session_state['auth_user']['id']}")
@@ -550,7 +562,6 @@ def main():
                 st.session_state['auth_user'] = None
                 st.rerun()
         else:
-            # Login Form
             uid = st.text_input("Email/ID").strip()
             pwd = st.text_input("Password", type="password").strip()
             
@@ -559,42 +570,30 @@ def main():
                     st.warning("Please enter your ID/Email")
                     return
                 
-                # 1. Admin Login (Hardcoded)
                 if uid == "admin" and pwd == "admin123":
                     st.session_state['auth_user'] = {"id":"admin", "name":"Admin", "role":"Admin"}
                     st.rerun()
                 
-                # 2. Database Login (Smart Search - Try 3 variations)
+                # Smart Search (3 Variations)
                 try:
-                    # Variation A: As typed (lowercase) -> e.g., "dr.aruna.r@amc.edu"
                     v1 = uid.lower()
-                    # Variation B: Sanitized Key (Upper, no dots) -> e.g., "DR_ARUNA_R@AMC_EDU"
                     v2 = sanitize_key(uid)
-                    # Variation C: As typed (Original)
                     v3 = uid
 
-                    # Try finding the user with any of these keys
                     target_doc = None
                     final_id = None
 
-                    # Check V1
                     doc = db.collection('Users').document(v1).get()
-                    if doc.exists: 
-                        target_doc = doc; final_id = v1
+                    if doc.exists: target_doc = doc; final_id = v1
                     
-                    # Check V2 (Fallback)
                     if not target_doc:
                         doc = db.collection('Users').document(v2).get()
-                        if doc.exists: 
-                            target_doc = doc; final_id = v2
+                        if doc.exists: target_doc = doc; final_id = v2
 
-                    # Check V3 (Fallback)
                     if not target_doc:
                         doc = db.collection('Users').document(v3).get()
-                        if doc.exists: 
-                            target_doc = doc; final_id = v3
+                        if doc.exists: target_doc = doc; final_id = v3
 
-                    # Validate Password
                     if target_doc:
                         user_data = target_doc.to_dict()
                         if user_data.get('password') == pwd:
@@ -609,7 +608,6 @@ def main():
                 except Exception as e: 
                     st.error(f"System Error: {e}")
 
-    # Routing based on Role
     user = st.session_state.get('auth_user')
     if user:
         if user['role'] == "Admin": admin_dashboard()
