@@ -122,7 +122,6 @@ def generate_session_report(dept, start_date, end_date):
                 })
         return pd.DataFrame(data)
     except Exception as e:
-        st.error(f"Report Error: {e}")
         return pd.DataFrame()
 
 def generate_student_summary_report(dept, sem, section):
@@ -160,7 +159,6 @@ def generate_student_summary_report(dept, sem, section):
                 "Name": name
             }
             
-            # Initialize 0 for empty summaries
             if not structured:
                 try:
                     courses = db.collection('Courses').where("dept", "==", dept)\
@@ -193,7 +191,7 @@ def generate_student_summary_report(dept, sem, section):
             return df[final_cols].sort_values(by="USN").fillna(0)
             
         return pd.DataFrame()
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
 # ==========================================
@@ -338,7 +336,6 @@ def render_report_tab(prefix=""):
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
     c1, c2 = st.columns(2)
-    # UNIQUE KEYS PREVENT JUMPING
     l_start = c1.date_input("From Date", datetime.date.today().replace(day=1), key=f'{prefix}rep_start_date')
     l_end = c2.date_input("To Date", datetime.date.today(), key=f'{prefix}rep_end_date')
     
@@ -374,14 +371,18 @@ def faculty_dashboard(user):
             period_val = c_period.selectbox("Period", ["1", "2", "3", "4", "5", "6", "7", "Lab"], key='mark_period')
             
             session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
-            already_marked = False
-            try:
-                already_marked = db.collection('Class_Sessions').document(session_id).get().exists
-            except: pass
+            
+            # Check if exists and fetch OLD data for comparison
+            doc_ref = db.collection('Class_Sessions').document(session_id)
+            doc_snap = doc_ref.get()
+            already_marked = doc_snap.exists
+            old_absentees = []
+            if already_marked:
+                old_absentees = doc_snap.to_dict().get('absentees', [])
             
             if already_marked:
-                st.error("⚠️ Already marked.")
-                if not st.checkbox("Unlock to Overwrite?", key='unlock_mark'): st.stop()
+                st.warning(f"⚠️ Marked. Absentees: {len(old_absentees)}")
+                if not st.checkbox("Unlock to Update?", key='unlock_mark'): st.stop()
             
             s_list = sorted(get_students_cached(course['dept'], course['sem'], course['section']), key=lambda x: x['usn'])
             
@@ -391,26 +392,56 @@ def faculty_dashboard(user):
                     select_all = st.checkbox("Select All", value=True)
                     cols = st.columns(4); status_map = {}
                     for i, s in enumerate(s_list):
-                        status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=select_all, key=s['usn'])
+                        # Pre-fill checkbox based on previous log if editing
+                        default_val = select_all
+                        if already_marked:
+                            default_val = s['usn'] not in old_absentees
+                        
+                        status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=default_val, key=s['usn'])
                     
-                    if st.form_submit_button("Submit"):
-                        absentees = [u for u, p in status_map.items() if not p]
+                    if st.form_submit_button("Submit Update"):
+                        new_absentees = [u for u, p in status_map.items() if not p]
                         batch = db.batch()
-                        batch.set(db.collection('Class_Sessions').document(session_id), {
+                        
+                        # 1. Update the Log
+                        batch.set(doc_ref, {
                             "course_code": course['subcode'], "date": str(date_val),
                             "period": period_val, "faculty_id": user['id'], "faculty_name": user['name'],
-                            "total_students": len(s_list), "absentees": absentees, "timestamp": datetime.datetime.now()
+                            "total_students": len(s_list), "absentees": new_absentees, "timestamp": datetime.datetime.now()
                         })
                         
+                        sub_key = sanitize_key(course['subcode'])
+                        
+                        # 2. Logic: New Entry vs Update
                         if not already_marked:
-                            sub_key = sanitize_key(course['subcode'])
+                            # NEW ENTRY: Increment Total + Attended
                             for s in s_list:
                                 ref = db.collection('Student_Summaries').document(s['usn'])
                                 batch.set(ref, {f"{sub_key}.title": course['subtitle'], f"{sub_key}.total": firestore.Increment(1)}, merge=True)
-                                if s['usn'] not in absentees: batch.set(ref, {f"{sub_key}.attended": firestore.Increment(1)}, merge=True)
-                            st.success("✅ Saved!")
+                                if s['usn'] not in new_absentees: 
+                                    batch.set(ref, {f"{sub_key}.attended": firestore.Increment(1)}, merge=True)
+                            st.success("✅ Saved New Record!")
+                        
                         else:
-                            st.warning("Log updated. Stats not incremented.")
+                            # UPDATE ENTRY: Adjust ONLY individual students who changed status
+                            # Do NOT increment 'total' classes
+                            changes = 0
+                            for s in s_list:
+                                usn = s['usn']
+                                ref = db.collection('Student_Summaries').document(usn)
+                                
+                                # Was Absent -> Now Present (+1 Attended)
+                                if usn in old_absentees and usn not in new_absentees:
+                                    batch.set(ref, {f"{sub_key}.attended": firestore.Increment(1)}, merge=True)
+                                    changes += 1
+                                
+                                # Was Present -> Now Absent (-1 Attended)
+                                elif usn not in old_absentees and usn in new_absentees:
+                                    batch.set(ref, {f"{sub_key}.attended": firestore.Increment(-1)}, merge=True)
+                                    changes += 1
+                                    
+                            st.success(f"♻️ Updated! Adjusted stats for {changes} students.")
+                            
                         batch.commit()
     with tab_history:
         try:
