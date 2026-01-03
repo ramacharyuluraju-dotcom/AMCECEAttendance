@@ -33,8 +33,7 @@ if not firebase_admin._apps:
             cred = credentials.Certificate("firebase_key.json")
         firebase_admin.initialize_app(cred)
     except Exception as e:
-        # If app is already initialized, we pass. 
-        # If it fails for other reasons, the app might show an error later.
+        # If app is already initialized, we pass.
         pass
 
 db = firestore.client()
@@ -97,7 +96,7 @@ def generate_email(name, existing_email=None):
     return f"{clean_name}@amc.edu"
 
 # ==========================================
-# 4. REPORT GENERATORS (ADMIN TOOLS)
+# 4. REPORT GENERATORS
 # ==========================================
 
 def generate_session_report(dept, start_date, end_date):
@@ -147,8 +146,8 @@ def generate_session_report(dept, start_date, end_date):
 
 def generate_student_summary_report(dept, sem, section):
     """
-    2. VTU Detention/Shortage Report.
-    Columns: AY, Dept, Sem, Sec, USN, Name, Subject, Classes(A/T), %, Status, Signatures
+    2. VTU Detention Report.
+    Columns: AY, Dept, Sem, Sec, USN, Name, Subject, Held, Attended, %, Status, Signatures
     """
     # A. Get Students
     students = get_students_cached(dept, sem, section)
@@ -197,9 +196,10 @@ def generate_student_summary_report(dept, sem, section):
                     "Section": section,
                     "USN": usn,
                     "Name": name,
-                    "Subject": code,
-                    "Title": stats.get('title', code),
-                    "Classes": f"{att}/{tot}",
+                    "Subject Code": code,
+                    "Subject Title": stats.get('title', code),
+                    "Classes Held": tot,       # Int for Excel
+                    "Classes Attended": att,   # Int for Excel
                     "Percentage": round(pct, 2),
                     "Status": status,
                     "Student Sign": "", # Placeholder for print
@@ -210,12 +210,67 @@ def generate_student_summary_report(dept, sem, section):
     if report_data:
         df = pd.DataFrame(report_data)
         # Sort by USN first, then Subject Code
-        return df.sort_values(by=['USN', 'Subject'])
+        return df.sort_values(by=['USN', 'Subject Code'])
         
     return pd.DataFrame()
 
 # ==========================================
-# 5. CSV BATCH PROCESSORS
+# 5. UI COMPONENTS (Reusable)
+# ==========================================
+
+def render_report_tab():
+    """
+    Shared Report UI for Admin and Faculty.
+    Allows downloading reports with Dropdown selections.
+    """
+    st.header("📊 Attendance Reports")
+    
+    # --- Report 1: VTU List ---
+    st.subheader("1. 🎓 VTU Shortage/Detention List")
+    st.info("Download the mandatory attendance report for students/parents.")
+    
+    c1, c2, c3 = st.columns(3)
+    # Dropdowns for easier selection
+    s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE", "Basic Science"], index=0)
+    s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2)
+    s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0)
+    
+    if st.button("Generate Detention List"):
+        with st.spinner("Processing..."):
+            df = generate_student_summary_report(s_dept, s_sem, s_sec)
+        
+        if not df.empty:
+            st.success(f"Generated report for {len(df)} records.")
+            st.dataframe(df.head())
+            csv = df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="⬇️ Download VTU Format CSV",
+                data=csv,
+                file_name=f"VTU_Attendance_{s_dept}_{s_sem}_{s_sec}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("No data found for this selection.")
+
+    st.divider()
+    
+    # --- Report 2: Logs ---
+    st.subheader("2. 📝 Class Log (Audit)")
+    c1, c2, c3 = st.columns(3)
+    l_dept = c1.selectbox("Log Dept", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0)
+    l_start = c2.date_input("From Date", datetime.date.today().replace(day=1))
+    l_end = c3.date_input("To Date", datetime.date.today())
+    
+    if st.button("Generate Class Logs"):
+        df = generate_session_report(l_dept, l_start, l_end)
+        if not df.empty:
+            st.dataframe(df)
+            st.download_button("Download Logs", df.to_csv(index=False).encode('utf-8'), "class_logs.csv", "text/csv")
+        else:
+            st.warning("No classes found.")
+
+# ==========================================
+# 6. CSV BATCH PROCESSORS
 # ==========================================
 
 def process_courses_csv(df):
@@ -310,15 +365,17 @@ def process_students_csv(df):
             "batch": str(row.get('batch', ''))
         })
         
-        # 2. Link Subjects (Init stats)
+        # 2. Link Subjects (With SAFE Initialization)
         k = f"{dept}_{sem}_{sec}"
         if k in course_map:
             updates = {}
             for subj in course_map[k]:
                 code = sanitize_key(subj['subcode'])
                 updates[f"{code}.title"] = subj['subtitle']
-                # Note: We do NOT reset total/attended here to avoid overwriting existing data.
-                # Use Admin Tool -> Sync/Fix for that.
+                # NEW: Initialize to 0 if missing, but DO NOT overwrite if exists
+                updates[f"{code}.total"] = firestore.Increment(0)
+                updates[f"{code}.attended"] = firestore.Increment(0)
+            
             if updates: 
                 batch.set(db.collection('Student_Summaries').document(usn), updates, merge=True)
             
@@ -375,7 +432,7 @@ def admin_force_sync():
     return updated
 
 # ==========================================
-# 6. DASHBOARDS
+# 7. DASHBOARDS
 # ==========================================
 
 def faculty_dashboard(user):
@@ -383,91 +440,88 @@ def faculty_dashboard(user):
     
     my_courses = get_faculty_courses(user['id'])
     
-    if not my_courses:
-        st.warning("No courses linked to your email.")
-        return
-        
-    c_map = {f"{c['subcode']} ({c['section']})" : c for c in my_courses}
-    sel_name = st.selectbox("Select Class", list(c_map.keys()))
-    course = c_map[sel_name]
+    # Tabs: Attendance | History | Reports (NEW)
+    t1, t2, t3 = st.tabs(["📝 Attendance", "📜 History", "📊 Reports"])
     
-    t1, t2 = st.tabs(["📝 Attendance", "📜 History"])
-    
+    # --- Tab 1: Mark Attendance ---
     with t1:
-        st.subheader(f"{course['subcode']} - {course['subtitle']}")
-        
-        # --- Time Slot Selection ---
-        c_date, c_period = st.columns(2)
-        date_val = c_date.date_input("Date", datetime.date.today())
-        period_val = c_period.selectbox("Period", ["1st Hour", "2nd Hour", "3rd Hour", "4th Hour", "5th Hour", "6th Hour", "7th Hour", "Lab"])
-        
-        # --- Check for Duplicates ---
-        session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
-        existing_doc = db.collection('Class_Sessions').document(session_id).get()
-        already_marked = existing_doc.exists
-        
-        if already_marked:
-            st.error(f"⚠️ {period_val} on {date_val} ALREADY MARKED.")
-            if not st.checkbox("Allow Overwrite? (Stats won't increment)"): 
-                st.stop()
-        
-        if st.button("🔄 Refresh"): 
-            get_students_cached.clear()
-            st.rerun()
+        if not my_courses:
+            st.warning("No courses linked to your email.")
+        else:
+            c_map = {f"{c['subcode']} ({c['section']})" : c for c in my_courses}
+            sel_name = st.selectbox("Select Class", list(c_map.keys()))
+            course = c_map[sel_name]
             
-        s_list = sorted(get_students_cached(course['dept'], course['sem'], course['section']), key=lambda x: x['usn'])
-        
-        if not s_list: 
-            st.error("No students found.")
-            return
+            st.subheader(f"{course['subcode']} - {course['subtitle']}")
             
-        with st.form("mark"):
-            proxy_name = st.text_input("Faculty", value=user['name'])
-            st.write(f"**Total: {len(s_list)}**")
-            select_all = st.checkbox("Select All", value=True)
+            c_date, c_period = st.columns(2)
+            date_val = c_date.date_input("Date", datetime.date.today())
+            period_val = c_period.selectbox("Period", ["1st Hour", "2nd Hour", "3rd Hour", "4th Hour", "5th Hour", "6th Hour", "7th Hour", "Lab"])
             
-            cols = st.columns(4)
-            status_map = {}
-            for i, s in enumerate(s_list):
-                ukey = f"{s['usn']}_{date_val}_{period_val}" 
-                status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=select_all, key=ukey)
+            session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
+            existing_doc = db.collection('Class_Sessions').document(session_id).get()
+            already_marked = existing_doc.exists
             
-            if st.form_submit_button("Submit"):
-                absentees = [u for u, p in status_map.items() if not p]
-                batch = db.batch()
+            if already_marked:
+                st.error(f"⚠️ {period_val} on {date_val} ALREADY MARKED.")
+                if not st.checkbox("Allow Overwrite? (Stats won't increment)"): 
+                    st.stop()
+            
+            if st.button("🔄 Refresh"): 
+                get_students_cached.clear()
+                st.rerun()
                 
-                # A. Log Session
-                batch.set(db.collection('Class_Sessions').document(session_id), {
-                    "course_code": course['subcode'], 
-                    "section": course['section'], 
-                    "date": str(date_val),
-                    "period": period_val, 
-                    "faculty_id": user['id'], 
-                    "faculty_name": proxy_name,
-                    "absentees": absentees, 
-                    "timestamp": datetime.datetime.now()
-                })
-                
-                # B. Update Stats (Only if new session)
-                if not already_marked:
-                    sub_key = sanitize_key(course['subcode'])
-                    for s in s_list:
-                        ref = db.collection('Student_Summaries').document(s['usn'])
-                        batch.set(ref, {
-                            f"{sub_key}.title": course['subtitle'], 
-                            f"{sub_key}.total": firestore.Increment(1)
-                        }, merge=True)
-                        
-                        if s['usn'] not in absentees:
-                            batch.set(ref, {
-                                f"{sub_key}.attended": firestore.Increment(1)
-                            }, merge=True)
-                    st.success("Saved!")
-                else:
-                    st.warning("Updated log only (Stats not incremented to prevent double count).")
+            s_list = sorted(get_students_cached(course['dept'], course['sem'], course['section']), key=lambda x: x['usn'])
+            
+            if not s_list: 
+                st.error("No students found.")
+            else:
+                with st.form("mark"):
+                    proxy_name = st.text_input("Faculty", value=user['name'])
+                    st.write(f"**Total: {len(s_list)}**")
+                    select_all = st.checkbox("Select All", value=True)
                     
-                batch.commit()
+                    cols = st.columns(4)
+                    status_map = {}
+                    for i, s in enumerate(s_list):
+                        ukey = f"{s['usn']}_{date_val}_{period_val}" 
+                        status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=select_all, key=ukey)
+                    
+                    if st.form_submit_button("Submit"):
+                        absentees = [u for u, p in status_map.items() if not p]
+                        batch = db.batch()
+                        
+                        # Log Session
+                        batch.set(db.collection('Class_Sessions').document(session_id), {
+                            "course_code": course['subcode'], 
+                            "section": course['section'], 
+                            "date": str(date_val),
+                            "period": period_val, 
+                            "faculty_id": user['id'], 
+                            "faculty_name": proxy_name,
+                            "absentees": absentees, 
+                            "timestamp": datetime.datetime.now()
+                        })
+                        
+                        # Update Stats (Only if new session)
+                        if not already_marked:
+                            sub_key = sanitize_key(course['subcode'])
+                            for s in s_list:
+                                ref = db.collection('Student_Summaries').document(s['usn'])
+                                batch.set(ref, {
+                                    f"{sub_key}.title": course['subtitle'], 
+                                    f"{sub_key}.total": firestore.Increment(1)
+                                }, merge=True)
+                                if s['usn'] not in absentees:
+                                    batch.set(ref, {
+                                        f"{sub_key}.attended": firestore.Increment(1)
+                                    }, merge=True)
+                            st.success("Saved!")
+                        else:
+                            st.warning("Updated log only (Stats not incremented).")
+                        batch.commit()
                 
+    # --- Tab 2: History ---
     with t2:
         logs = list(db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream())
         data = [{
@@ -479,11 +533,14 @@ def faculty_dashboard(user):
         } for l in logs]
         
         data.sort(key=lambda x: x.get('timestamp',''), reverse=True)
-        
         if data: 
             st.dataframe(pd.DataFrame(data)[['date', 'period', 'course', 'section']], use_container_width=True)
         else: 
             st.info("No history.")
+            
+    # --- Tab 3: Reports (NEW) ---
+    with t3:
+        render_report_tab()
 
 def student_dashboard():
     st.markdown("<h1 style='text-align: center;'>🎓 Student Portal</h1>", unsafe_allow_html=True)
@@ -503,7 +560,6 @@ def student_dashboard():
             
             data = doc.to_dict()
             structured = {}
-            
             # Smart Un-flattening
             for k, v in data.items():
                 if "." in k:
@@ -583,45 +639,8 @@ def admin_dashboard():
                 st.error("Not found.")
 
     with t3:
-        st.header("📊 Reports")
-        
-        st.subheader("1. 📝 Class Log Report")
-        c1, c2, c3 = st.columns(3)
-        r_dept = c1.text_input("Dept", "ECE").upper()
-        r_start = c2.date_input("From", datetime.date.today().replace(day=1))
-        r_end = c3.date_input("To", datetime.date.today())
-        
-        if st.button("Generate Log"):
-            df = generate_session_report(r_dept, r_start, r_end)
-            if not df.empty:
-                st.dataframe(df)
-                st.download_button("Download CSV", df.to_csv(index=False).encode('utf-8'), "class_log.csv", "text/csv")
-            else: 
-                st.warning("No data.")
-
-        st.divider()
-        
-        st.subheader("2. 🎓 Student Summary (VTU Shortage List)")
-        c1, c2, c3 = st.columns(3)
-        s_dept = c1.text_input("Department", "ECE").upper()
-        s_sem = c2.text_input("Semester", "3")
-        s_sec = c3.text_input("Section", "A").upper()
-        
-        if st.button("Generate Student Report"):
-            with st.spinner("Processing..."):
-                df = generate_student_summary_report(s_dept, s_sem, s_sec)
-            
-            if not df.empty:
-                st.dataframe(df)
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⬇️ Download VTU Format CSV",
-                    data=csv,
-                    file_name=f"VTU_Attendance_{s_dept}_{s_sem}_{s_sec}.csv",
-                    mime="text/csv"
-                )
-            else: 
-                st.warning("No students or data found.")
+        # Shared Report UI
+        render_report_tab()
 
     with t4:
         if st.button("Load Faculty"):
@@ -636,7 +655,7 @@ def admin_dashboard():
             get_students_cached.clear()
 
 # ==========================================
-# 7. MAIN ROUTER
+# 8. MAIN ROUTER
 # ==========================================
 
 def main():
