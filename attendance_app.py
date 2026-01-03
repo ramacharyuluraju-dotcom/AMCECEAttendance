@@ -424,11 +424,24 @@ def admin_dashboard():
         with tab_new:
             with st.form("add_fac"):
                 c1, c2 = st.columns(2)
-                n_name = c1.text_input("Name"); n_dept = c2.text_input("Dept")
-                n_email = c1.text_input("Email"); n_pass = c2.text_input("Password", type="password")
+                n_name = c1.text_input("Name")
+                n_dept = c2.text_input("Dept")
+                n_email = c1.text_input("Email")
+                n_pass = c2.text_input("Password", type="password")
+                
                 if st.form_submit_button("Create"):
-                    db.collection('Users').document(n_email).set({"name":n_name, "role":"Faculty", "dept":n_dept, "password":n_pass})
-                    st.success("Created")
+                    # FIX: Force lowercase email for consistency
+                    clean_email = n_email.strip().lower()
+                    if clean_email:
+                        db.collection('Users').document(clean_email).set({
+                            "name": n_name, 
+                            "role": "Faculty", 
+                            "dept": n_dept, 
+                            "password": n_pass
+                        })
+                        st.success(f"Created Faculty: {clean_email}")
+                    else:
+                        st.error("Email is required.")
         
         with tab_manage:
             sel_dept = st.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], key='fac_dept')
@@ -445,7 +458,8 @@ def admin_dashboard():
                         with st.expander(f"{cd['subcode']} - {cd['subtitle']}"):
                             new_email = st.text_input("Reassign to (Email):", key=c.id)
                             if st.button("Update", key=f"btn_{c.id}"):
-                                db.collection('Courses').document(c.id).update({"faculty_id": new_email})
+                                # Fix: Ensure lowercase on reassignment
+                                db.collection('Courses').document(c.id).update({"faculty_id": new_email.strip().lower()})
                                 st.success("Reassigned")
                                 st.rerun()
                 else: st.info("No courses.")
