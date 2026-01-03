@@ -19,10 +19,13 @@ st.set_page_config(
 # Session State Initialization
 if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
+if 'admin_search_usn' not in st.session_state:
+    st.session_state['admin_search_usn'] = ""
 
 # Initialize Firebase
 if not firebase_admin._apps:
     try:
+        # Check if secrets exist (Streamlit Cloud), otherwise look for local file
         if "firebase" in st.secrets:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
@@ -145,6 +148,7 @@ def generate_student_summary_report(dept, sem, section):
             "Name": name
         }
         
+        # If no summary exists, initialize with 0
         if not structured:
             courses = db.collection('Courses').where("dept", "==", dept)\
                 .where("sem", "==", sem).where("section", "==", section).stream()
@@ -373,22 +377,36 @@ def faculty_dashboard(user):
                             st.warning("Log updated. Stats not incremented.")
                         batch.commit()
     with t2:
-        # FIX: Removed server-side sort to prevent index crash
+        # Fetch logs
         logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream()
-        # Sort in Python instead
+        # Sort in Python to avoid Index Error
         logs = sorted([l for l in logs_stream], key=lambda x: x.to_dict().get('date', ''), reverse=True)
         
         if logs:
             data = []
             for l in logs:
                 d = l.to_dict()
+                # SAFE GET to avoid crash if field is missing
+                d_date = d.get('date', 'Unknown')
+                d_period = d.get('period', '-')
+                d_code = d.get('course_code', '?')
                 tot = d.get('total_students', 0)
-                if tot == 0: tot = len(get_students_cached(d.get('dept','ECE'), d.get('sem','3'), d.get('section','A'))) # Fallback
+                
+                # Fallback if total is 0
+                if tot == 0: 
+                    tot = len(get_students_cached(d.get('dept','ECE'), d.get('sem','3'), d.get('section','A'))) 
+                
                 present = tot - len(d.get('absentees', []))
-                data.append({"Date":d['date'], "Period":d['period'], "Class":d['course_code'], "Present":f"{present}/{tot}"})
+                data.append({
+                    "Date": d_date, 
+                    "Period": d_period, 
+                    "Class": d_code, 
+                    "Present": f"{present}/{tot}"
+                })
+            
             st.dataframe(pd.DataFrame(data), use_container_width=True)
         else:
-            st.info("No history.")
+            st.info("No history found.")
     with t3:
         render_report_tab()
 
@@ -467,11 +485,9 @@ def admin_dashboard():
         st.subheader("Manage Students")
         ts, ta = st.tabs(["🔍 Search & Edit", "➕ Add Manual"])
         with ts:
-            # FIX: Layout for Search Button so it's not a "direct switch"
             c_search, c_btn = st.columns([3, 1])
             s_in_raw = c_search.text_input("Enter USN to Search", key="search_usn")
             
-            # Button triggers search logic
             if c_btn.button("🔍 Search", key='search_btn'):
                 st.session_state['admin_search_usn'] = s_in_raw.strip().upper()
             
@@ -482,9 +498,9 @@ def admin_dashboard():
                 if doc.exists:
                     d = doc.to_dict()
                     st.markdown("---")
-                    # FIX: Better Fonts and Layout
-                    st.markdown(f"## 👤 {d.get('name', 'N/A')}")
-                    st.markdown(f"### ID: `{s_in}`")
+                    # FIX: Reduced Font Sizes for better look
+                    st.subheader(f"👤 {d.get('name', 'N/A')}")
+                    st.caption(f"USN: {s_in}")
                     
                     with st.container(border=True):
                         c1, c2, c3 = st.columns(3)
@@ -541,13 +557,15 @@ def student_dashboard():
             df = pd.DataFrame(rows)
             st.metric("Average", f"{df['Percentage'].mean():.1f}%")
             
-            # FIX: Restored Graphic Representation (Altair Chart)
-            c = alt.Chart(df).mark_bar().encode(
-                x='Subject', 
-                y='Percentage',
-                color=alt.condition(alt.datum.Percentage < 75, alt.value('red'), alt.value('green')),
+            # FIX: Made chart compact and standard size (height=250)
+            c = alt.Chart(df).mark_bar(size=30).encode(
+                x=alt.X('Subject', sort='-y'), 
+                y=alt.Y('Percentage', scale=alt.Scale(domain=[0, 100])),
+                color=alt.condition(alt.datum.Percentage < 75, alt.value('#FF4B4B'), alt.value('#00CC96')),
                 tooltip=['Subject', 'Percentage']
-            ).properties(height=300)
+            ).properties(
+                height=250  # Fixed height so it's not huge
+            )
             st.altair_chart(c, use_container_width=True)
             
             st.dataframe(df)
@@ -574,7 +592,7 @@ def main():
                     st.session_state['auth_user'] = {"id":"admin", "name":"Admin", "role":"Admin"}
                     st.rerun()
                 
-                # Smart Search (3 Variations)
+                # Smart Search
                 try:
                     v1 = uid.lower()
                     v2 = sanitize_key(uid)
