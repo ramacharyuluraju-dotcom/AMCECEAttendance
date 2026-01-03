@@ -17,7 +17,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Session State Initialization
+# Session State
 if 'auth_user' not in st.session_state:
     st.session_state['auth_user'] = None
 
@@ -39,7 +39,7 @@ db = firestore.client()
 # 2. CACHING & OPTIMIZATION
 # ==========================================
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=60) # Reduced TTL for fresher data
 def get_students_cached(dept, sem, section):
     """Fetches student list from DB."""
     c_dept = str(dept).strip().upper()
@@ -75,21 +75,22 @@ def generate_email(name, existing_email=None):
     return f"{clean_name}@amc.edu"
 
 # ==========================================
-# 4. REPORT GENERATORS
+# 4. REPORT GENERATORS (FIXED)
 # ==========================================
 
 def generate_session_report(dept, start_date, end_date):
     """Class Log Report"""
-    all_courses = db.collection('Courses').stream()
+    # 1. Build Course Lookup for this Dept
+    all_courses = db.collection('Courses').where("dept", "==", dept).stream()
     course_lookup = {}
     for c in all_courses:
         d = c.to_dict()
-        if d.get('dept') == dept:
-            course_lookup[d['subcode']] = {
-                'sem': d.get('sem', 'N/A'),
-                'title': d.get('subtitle', '')
-            }
+        course_lookup[d['subcode']] = {
+            'sem': d.get('sem', 'N/A'),
+            'title': d.get('subtitle', '')
+        }
 
+    # 2. Query Sessions
     sessions = db.collection('Class_Sessions')\
         .where("date", ">=", str(start_date))\
         .where("date", "<=", str(end_date))\
@@ -99,6 +100,7 @@ def generate_session_report(dept, start_date, end_date):
     for s in sessions:
         d = s.to_dict()
         subcode = d.get('course_code', '')
+        # Only add if subject belongs to requested Dept
         if subcode in course_lookup:
             info = course_lookup[subcode]
             data.append({
@@ -116,35 +118,53 @@ def generate_session_report(dept, start_date, end_date):
     return pd.DataFrame(data)
 
 def generate_student_summary_report(dept, sem, section):
-    """VTU Detention Report (Shows All Subjects)"""
+    """VTU Detention Report (FIXED: Includes 0/0 students)"""
+    # 1. Get List of Students
     students = get_students_cached(dept, sem, section)
     if not students: return pd.DataFrame()
     
     report_data = []
     
+    # 2. Iterate ALL students (even those with no attendance yet)
     for s in students:
         usn = s['usn']
         name = s.get('name', 'Unknown')
         ay = s.get('ay', '2025_26')
         
+        # 3. Fetch Summary
         doc = db.collection('Student_Summaries').document(usn).get()
-        if not doc.exists: continue
         
-        raw_data = doc.to_dict()
         structured = {}
-        # Un-flatten logic
-        for k, v in raw_data.items():
-            if "." in k:
-                parts = k.split('.')
-                code, field = parts[0], parts[1]
-                if code not in structured: structured[code] = {}
-                structured[code][field] = v
-            elif isinstance(v, dict):
-                structured[k] = v
-                
+        
+        if doc.exists:
+            raw_data = doc.to_dict()
+            # Un-flatten logic
+            for k, v in raw_data.items():
+                if "." in k:
+                    parts = k.split('.')
+                    code, field = parts[0], parts[1]
+                    if code not in structured: structured[code] = {}
+                    structured[code][field] = v
+                elif isinstance(v, dict):
+                    structured[k] = v
+        
+        # 4. If no summary exists, look up what courses they SHOULD have
+        # This ensures they appear in the report even if they have 0 classes
+        if not structured:
+            courses = db.collection('Courses')\
+                .where("dept", "==", dept)\
+                .where("sem", "==", sem)\
+                .where("section", "==", section).stream()
+            for c in courses:
+                cd = c.to_dict()
+                sc = sanitize_key(cd['subcode'])
+                structured[sc] = {'title': cd['subtitle'], 'total': 0, 'attended': 0}
+
+        # 5. Build Rows
         for code, stats in structured.items():
             tot = stats.get('total', 0)
             att = stats.get('attended', 0)
+            absent = tot - att
             
             # Default to 100% if no classes held yet
             if tot == 0: pct = 100.0 
@@ -154,11 +174,14 @@ def generate_student_summary_report(dept, sem, section):
             
             report_data.append({
                 "AY": ay, "Dept": dept, "Sem": sem, "Section": section,
-                "USN": usn, "Name": name, "Subject Code": code,
+                "USN": usn, "Name": name, 
+                "Subject Code": code,
                 "Subject Title": stats.get('title', code),
-                "Classes Held": tot, "Classes Attended": att,   
-                "Percentage": round(pct, 2), "Status": status,
-                "Student Sign": "", "Parent Sign": ""
+                "Total Classes": tot,         # <--- Explicit
+                "Classes Attended": att,      # <--- Explicit
+                "Classes Absent": absent,     # <--- Explicit
+                "Percentage": round(pct, 2), 
+                "Status": status
             })
                 
     if report_data:
@@ -185,11 +208,11 @@ def render_report_tab():
         
         if not df.empty:
             st.success(f"Generated report for {len(df)} records.")
-            st.dataframe(df.head())
+            st.dataframe(df)
             csv = df.to_csv(index=False).encode('utf-8')
             st.download_button("⬇️ Download VTU Format CSV", csv, f"VTU_Attendance_{s_dept}_{s_sem}_{s_sec}.csv", "text/csv")
         else:
-            st.warning("No data found.")
+            st.warning("No data found for this class.")
 
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
@@ -378,6 +401,7 @@ def faculty_dashboard(user):
         if data: st.dataframe(pd.DataFrame(data)); 
         else: st.info("No history.")
     with t3:
+        # FACULTY CAN NOW SEE REPORTS TOO
         render_report_tab()
 
 def student_dashboard():
@@ -421,11 +445,13 @@ def admin_dashboard():
     with t1:
         c1, c2 = st.columns(2)
         with c1:
+            st.write("#### 1. Bulk Courses")
             f1 = st.file_uploader("Courses CSV", type='csv', key='a')
             if f1 and st.button("Process Courses"):
                 c, logs = process_courses_csv(pd.read_csv(f1))
                 st.success(f"Processed {c} courses."); st.expander("Logs").write(logs)
         with c2:
+            st.write("#### 2. Bulk Students")
             f2 = st.file_uploader("Students CSV", type='csv', key='b')
             if f2 and st.button("Process Students"):
                 c = process_students_csv(pd.read_csv(f2))
@@ -450,45 +476,94 @@ def admin_dashboard():
         with c1.form("add_fac"):
             st.write("Add New Faculty")
             n_name = st.text_input("Name"); n_email = st.text_input("Email (ID)"); n_dept = st.text_input("Dept"); n_pass = st.text_input("Password", type="password")
-            if st.form_submit_button("Create"):
+            if st.form_submit_button("Create Faculty"):
                 if n_email and n_pass:
                     db.collection('Users').document(n_email).set({"name":n_name, "role":"Faculty", "dept":n_dept, "password":n_pass})
                     st.success("Created")
+        
         with c2:
             st.write("Existing Faculty")
             facs = list(db.collection('Users').where("role", "==", "Faculty").stream())
             if facs:
-                f_map = {f.id: f for f in facs}
-                to_del = st.selectbox("Select to Delete", list(f_map.keys()))
-                if st.button("Delete"):
-                    db.collection('Users').document(to_del).delete(); st.success("Deleted"); st.rerun()
-                # FIX: Show Email/ID
-                st.dataframe(pd.DataFrame([{"Email/ID":f.id, **f.to_dict()} for f in facs]))
+                df_fac = pd.DataFrame([{"Email/ID": f.id, **f.to_dict()} for f in facs])
+                st.dataframe(df_fac[["Email/ID", "name", "dept"]], use_container_width=True)
+                
+                st.divider()
+                st.write("⚠️ **Safe Delete**")
+                to_del = st.selectbox("Select Faculty to Remove", [f.id for f in facs])
+                
+                if st.button("Remove Faculty"):
+                    # Unassign courses (Safe Delete)
+                    courses = db.collection('Courses').where("faculty_id", "==", to_del).stream()
+                    batch = db.batch()
+                    count = 0
+                    for c in courses:
+                        batch.update(c.reference, {"faculty_id": "UNASSIGNED", "faculty_name": "Unassigned"})
+                        count += 1
+                    
+                    batch.delete(db.collection('Users').document(to_del))
+                    batch.commit()
+                    st.success(f"Removed {to_del}. {count} courses unassigned.")
+                    st.rerun()
 
     with t5:
         st.subheader("Manage Students")
-        s_search = st.text_input("Search USN").strip().upper()
-        if s_search:
-            s_doc = db.collection('Students').document(s_search).get()
-            if s_doc.exists:
-                d = s_doc.to_dict()
-                with st.form("edit_stu"):
-                    c1, c2 = st.columns(2)
-                    e_name = c1.text_input("Name", d.get('name','')); e_dept = c2.text_input("Dept", d.get('dept',''))
-                    e_sem = c1.text_input("Sem", d.get('sem','')); e_sec = c2.text_input("Sec", d.get('section',''))
-                    if st.form_submit_button("Update"):
-                        db.collection('Students').document(s_search).update({"name":e_name, "dept":e_dept, "sem":e_sem, "section":e_sec})
-                        st.success("Updated")
-                if st.button("Delete Student"):
-                    db.collection('Students').document(s_search).delete(); db.collection('Student_Summaries').document(s_search).delete()
-                    st.error("Deleted")
-            else: st.warning("Not found")
-        st.divider()
-        c1, c2, c3 = st.columns(3)
-        dept = c1.text_input("D", "ECE"); sem = c2.text_input("S", "3"); sec = c3.text_input("Sec", "A")
-        if st.button("Search List"):
-            st.dataframe(pd.DataFrame(get_students_cached(dept, sem, sec)))
-            get_students_cached.clear()
+        tab_search, tab_add = st.tabs(["🔍 Search & Edit", "➕ Add New Student"])
+        
+        with tab_search:
+            s_search = st.text_input("Enter USN to Search", placeholder="1MV...").strip().upper()
+            if s_search:
+                s_doc = db.collection('Students').document(s_search).get()
+                if s_doc.exists:
+                    d = s_doc.to_dict()
+                    st.success(f"Found: {d.get('name')}")
+                    with st.form("edit_stu"):
+                        c1, c2 = st.columns(2)
+                        e_name = c1.text_input("Name", d.get('name', ''))
+                        e_dept = c2.text_input("Dept", d.get('dept', ''))
+                        e_sem = c1.text_input("Sem", d.get('sem', ''))
+                        e_sec = c2.text_input("Section", d.get('section', ''))
+                        if st.form_submit_button("Update Student Profile"):
+                            db.collection('Students').document(s_search).update({"name": e_name, "dept": e_dept, "sem": e_sem, "section": e_sec})
+                            st.success("✅ Profile Updated!")
+                    
+                    if st.button("❌ Delete Student"):
+                        db.collection('Students').document(s_search).delete()
+                        db.collection('Student_Summaries').document(s_search).delete()
+                        st.error(f"Deleted {s_search}")
+                        st.rerun()
+                else:
+                    st.warning("USN not found.")
+
+        with tab_add:
+            st.write("Manually register a student.")
+            with st.form("add_student_manual"):
+                c1, c2 = st.columns(2)
+                m_usn = c1.text_input("USN").strip().upper()
+                m_name = c2.text_input("Name")
+                m_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0)
+                m_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2)
+                m_sec = c1.text_input("Section", "A").strip().upper()
+                m_batch = c2.text_input("Batch", "2025")
+                m_ay = "2025_26"
+                
+                if st.form_submit_button("Add Student"):
+                    if m_usn and m_name:
+                        db.collection('Students').document(m_usn).set({
+                            "name": m_name, "dept": m_dept, "sem": m_sem, 
+                            "section": m_sec, "ay": m_ay, "batch": m_batch
+                        })
+                        # Auto-Link Logic
+                        courses = db.collection('Courses').where("dept", "==", m_dept)\
+                            .where("sem", "==", m_sem).where("section", "==", m_sec).stream()
+                        updates = {}
+                        for c in courses:
+                            cd = c.to_dict(); sc = sanitize_key(cd['subcode'])
+                            updates[f"{sc}.title"] = cd['subtitle']
+                            updates[f"{sc}.total"] = firestore.Increment(0)
+                            updates[f"{sc}.attended"] = firestore.Increment(0)
+                        if updates: db.collection('Student_Summaries').document(m_usn).set(updates, merge=True)
+                        st.success(f"✅ Added {m_name}")
 
 def main():
     with st.sidebar:
