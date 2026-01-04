@@ -317,17 +317,23 @@ def admin_force_sync():
 
 def render_report_tab(prefix=""):
     st.subheader("1. 🎓 Consolidated Detention/Attendance Report")
-    c1, c2, c3 = st.columns(3)
-    s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key=f'{prefix}rep_dept')
-    s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key=f'{prefix}rep_sem')
-    s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key=f'{prefix}rep_sec')
     
-    if st.button("Generate Consolidated Report", key=f'{prefix}btn_cons'):
+    # IMPROVEMENT: Use Form to prevent reruns on dropdown select
+    with st.form(key=f'{prefix}report_form'):
+        c1, c2, c3 = st.columns(3)
+        s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key=f'{prefix}rep_dept')
+        s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key=f'{prefix}rep_sem')
+        s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key=f'{prefix}rep_sec')
+        
+        # Submit Button acts as trigger
+        submit_cons = st.form_submit_button("🚀 Generate Consolidated Report")
+
+    if submit_cons:
         with st.spinner("Processing..."):
             df = generate_student_summary_report(s_dept, s_sem, s_sec)
         
         if not df.empty:
-            st.success(f"Generated report for {len(df)} students.")
+            st.toast(f"Report Generated: {len(df)} students", icon="✅")
             st.dataframe(df)
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode('utf-8'), "Consolidated_Attendance.csv", key=f'{prefix}dl_cons')
         else:
@@ -335,11 +341,16 @@ def render_report_tab(prefix=""):
 
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
-    c1, c2 = st.columns(2)
-    l_start = c1.date_input("From Date", datetime.date.today().replace(day=1), key=f'{prefix}rep_start_date')
-    l_end = c2.date_input("To Date", datetime.date.today(), key=f'{prefix}rep_end_date')
     
-    if st.button("Generate Class Logs", key=f'{prefix}btn_logs'):
+    # IMPROVEMENT: Use Form to prevent reruns on Date Select
+    with st.form(key=f'{prefix}log_form'):
+        c1, c2 = st.columns(2)
+        l_start = c1.date_input("From Date", datetime.date.today().replace(day=1), key=f'{prefix}rep_start_date')
+        l_end = c2.date_input("To Date", datetime.date.today(), key=f'{prefix}rep_end_date')
+        
+        submit_logs = st.form_submit_button("🚀 Generate Class Logs")
+
+    if submit_logs:
         df = generate_session_report(s_dept, l_start, l_end)
         if not df.empty:
             st.dataframe(df)
@@ -350,10 +361,9 @@ def render_report_tab(prefix=""):
 def faculty_dashboard(user):
     st.title(f"👨‍🏫 {user['name']}")
     
-    # --- FIX: DEFINE TABS FIRST TO PREVENT RESETS ---
+    # Define tabs first to avoid jumping
     tab_attendance, tab_history, tab_reports = st.tabs(["📝 Attendance", "📜 History", "📊 Reports"])
     
-    # Fetch Data
     my_courses = get_faculty_courses(user['id'])
     
     with tab_attendance:
@@ -372,13 +382,16 @@ def faculty_dashboard(user):
             
             session_id = f"{date_val}_{course['subcode']}_{course['section']}_{period_val}"
             
-            # Check if exists and fetch OLD data for comparison
-            doc_ref = db.collection('Class_Sessions').document(session_id)
-            doc_snap = doc_ref.get()
-            already_marked = doc_snap.exists
+            # Check existing
+            already_marked = False
             old_absentees = []
-            if already_marked:
-                old_absentees = doc_snap.to_dict().get('absentees', [])
+            try:
+                doc_ref = db.collection('Class_Sessions').document(session_id)
+                doc_snap = doc_ref.get()
+                already_marked = doc_snap.exists
+                if already_marked:
+                    old_absentees = doc_snap.to_dict().get('absentees', [])
+            except: pass
             
             if already_marked:
                 st.warning(f"⚠️ Marked. Absentees: {len(old_absentees)}")
@@ -392,18 +405,14 @@ def faculty_dashboard(user):
                     select_all = st.checkbox("Select All", value=True)
                     cols = st.columns(4); status_map = {}
                     for i, s in enumerate(s_list):
-                        # Pre-fill checkbox based on previous log if editing
                         default_val = select_all
-                        if already_marked:
-                            default_val = s['usn'] not in old_absentees
-                        
+                        if already_marked: default_val = s['usn'] not in old_absentees
                         status_map[s['usn']] = cols[i%4].checkbox(s['usn'], value=default_val, key=s['usn'])
                     
                     if st.form_submit_button("Submit Update"):
                         new_absentees = [u for u, p in status_map.items() if not p]
                         batch = db.batch()
                         
-                        # 1. Update the Log
                         batch.set(doc_ref, {
                             "course_code": course['subcode'], "date": str(date_val),
                             "period": period_val, "faculty_id": user['id'], "faculty_name": user['name'],
@@ -412,40 +421,32 @@ def faculty_dashboard(user):
                         
                         sub_key = sanitize_key(course['subcode'])
                         
-                        # 2. Logic: New Entry vs Update
                         if not already_marked:
-                            # NEW ENTRY: Increment Total + Attended
                             for s in s_list:
                                 ref = db.collection('Student_Summaries').document(s['usn'])
                                 batch.set(ref, {f"{sub_key}.title": course['subtitle'], f"{sub_key}.total": firestore.Increment(1)}, merge=True)
                                 if s['usn'] not in new_absentees: 
                                     batch.set(ref, {f"{sub_key}.attended": firestore.Increment(1)}, merge=True)
-                            st.success("✅ Saved New Record!")
+                            st.toast("New Attendance Saved!", icon="✅")
                         
                         else:
-                            # UPDATE ENTRY: Adjust ONLY individual students who changed status
-                            # Do NOT increment 'total' classes
                             changes = 0
                             for s in s_list:
                                 usn = s['usn']
                                 ref = db.collection('Student_Summaries').document(usn)
-                                
-                                # Was Absent -> Now Present (+1 Attended)
                                 if usn in old_absentees and usn not in new_absentees:
                                     batch.set(ref, {f"{sub_key}.attended": firestore.Increment(1)}, merge=True)
                                     changes += 1
-                                
-                                # Was Present -> Now Absent (-1 Attended)
                                 elif usn not in old_absentees and usn in new_absentees:
                                     batch.set(ref, {f"{sub_key}.attended": firestore.Increment(-1)}, merge=True)
                                     changes += 1
-                                    
-                            st.success(f"♻️ Updated! Adjusted stats for {changes} students.")
-                            
+                            st.toast(f"Updated! {changes} students adjusted.", icon="♻️")
                         batch.commit()
     with tab_history:
         try:
-            logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id']).stream()
+            # OPTIMIZATION: Limit to recent 50 logs to prevent lag
+            logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id'])\
+                .limit(50).stream() 
             logs = sorted([l for l in logs_stream], key=lambda x: x.to_dict().get('date', ''), reverse=True)
             
             if logs:
@@ -458,19 +459,16 @@ def faculty_dashboard(user):
                         tot = len(get_students_cached(d.get('dept','ECE'), d.get('sem','3'), d.get('section','A'))) 
                     present = tot - len(d.get('absentees', []))
                     data.append({
-                        "Date": d_date, 
-                        "Period": d.get('period', '-'), 
-                        "Class": d.get('course_code', '?'), 
-                        "Present": f"{present}/{tot}"
+                        "Date": d_date, "Period": d.get('period', '-'), 
+                        "Class": d.get('course_code', '?'), "Present": f"{present}/{tot}"
                     })
                 st.dataframe(pd.DataFrame(data), use_container_width=True)
             else:
-                st.info("No history found.")
+                st.info("No recent history.")
         except Exception:
-            st.info("No history available.")
+            st.info("History unavailable.")
 
     with tab_reports:
-        # Pass Prefix to ensure unique IDs
         render_report_tab(prefix="fac_")
 
 def admin_dashboard():
@@ -483,17 +481,17 @@ def admin_dashboard():
             f1 = st.file_uploader("Courses CSV", type='csv', key='a')
             if f1 and st.button("Process Courses"):
                 c, logs = process_courses_csv(pd.read_csv(f1))
-                st.success(f"Processed {c} courses.")
+                st.toast(f"Processed {c} courses!", icon="✅")
         with c2:
             f2 = st.file_uploader("Students CSV", type='csv', key='b')
             if f2 and st.button("Process Students"):
                 c = process_students_csv(pd.read_csv(f2))
-                st.success(f"Registered {c} students.")
+                st.toast(f"Registered {c} students!", icon="✅")
 
     with t2:
         if st.button("🔄 Sync/Fix All"):
             with st.spinner("Syncing..."): n = admin_force_sync()
-            st.success(f"Synced {n} students.")
+            st.toast(f"Synced {n} student profiles!", icon="✅")
 
     with t3:
         render_report_tab(prefix="adm_")
@@ -503,20 +501,22 @@ def admin_dashboard():
         tab_new, tab_manage = st.tabs(["Add New", "Manage & Reassign"])
         
         with tab_new:
-            with st.form("add_fac"):
+            # IMPROVEMENT: Use Form for cleaner input
+            with st.form("add_fac_form"):
                 c1, c2 = st.columns(2)
                 n_name = c1.text_input("Name")
                 n_dept = c2.text_input("Dept")
                 n_email = c1.text_input("Email")
                 n_pass = c2.text_input("Password", type="password")
+                submit_fac = st.form_submit_button("Create Faculty")
                 
-                if st.form_submit_button("Create"):
+                if submit_fac:
                     clean_email = n_email.strip().lower()
                     if clean_email:
                         db.collection('Users').document(clean_email).set({
                             "name": n_name, "role": "Faculty", "dept": n_dept, "password": n_pass
                         })
-                        st.success(f"Created Faculty: {clean_email}")
+                        st.toast(f"Created Faculty: {clean_email}", icon="✅")
                     else: st.error("Email is required.")
         
         with tab_manage:
@@ -535,7 +535,8 @@ def admin_dashboard():
                                 new_email = st.text_input("Reassign to (Email):", key=c.id)
                                 if st.button("Update", key=f"btn_{c.id}"):
                                     db.collection('Courses').document(c.id).update({"faculty_id": new_email.strip().lower()})
-                                    st.success("Reassigned"); st.rerun()
+                                    st.toast("Reassigned Successfully", icon="✅")
+                                    st.rerun()
                     else: st.info("No courses.")
                 else: st.warning("No faculty found.")
             except: st.error("Error loading faculty.")
@@ -544,10 +545,13 @@ def admin_dashboard():
         st.subheader("Manage Students")
         ts, ta = st.tabs(["🔍 Search & Edit", "➕ Add Manual"])
         with ts:
-            c_search, c_btn = st.columns([3, 1])
-            s_in_raw = c_search.text_input("Enter USN to Search", key="search_usn")
+            # IMPROVEMENT: Use Form for Search to avoid partial typing reloads
+            with st.form("search_form"):
+                col_s, col_b = st.columns([3, 1])
+                s_in_raw = col_s.text_input("Enter USN")
+                search_btn = st.form_submit_button("🔍 Search")
             
-            if c_btn.button("🔍 Search", key='search_btn'):
+            if search_btn:
                 st.session_state['admin_search_usn'] = s_in_raw.strip().upper()
             
             s_in = st.session_state.get('admin_search_usn', '')
@@ -565,13 +569,13 @@ def admin_dashboard():
                         c2.text(f"Sem: {d.get('sem', '-')}")
                         c3.text(f"Section: {d.get('section', '-')}")
                     st.write("")
-                    with st.expander("⚠️ Danger Zone (Delete Student)"):
-                        st.warning("Action cannot be undone. Deletes student AND attendance stats.")
+                    with st.expander("⚠️ Danger Zone"):
+                        st.warning("Deletes student AND attendance stats.")
                         if st.checkbox(f"I confirm I want to delete {s_in}"):
                             if st.button("🗑️ Permanently Delete"):
                                 db.collection('Students').document(s_in).delete()
                                 db.collection('Student_Summaries').document(s_in).delete()
-                                st.success("Student Deleted Successfully.")
+                                st.toast("Deleted Successfully", icon="🗑️")
                                 st.session_state['admin_search_usn'] = ""
                                 st.rerun()
                 else: st.warning(f"Student '{s_in}' not found.")
@@ -580,7 +584,7 @@ def admin_dashboard():
                 m_usn = st.text_input("USN").upper(); m_name = st.text_input("Name")
                 m_dept = st.selectbox("Dept", ["ECE","CSE","ISE"]); m_sem = st.selectbox("Sem",["1","2","3","4","5","6","7","8"])
                 m_sec = st.text_input("Sec", "A").upper()
-                if st.form_submit_button("Add"):
+                if st.form_submit_button("Add Student"):
                     db.collection('Students').document(m_usn).set({"name":m_name,"dept":m_dept,"sem":m_sem,"section":m_sec,"ay":"2025_26"})
                     courses = db.collection('Courses').where("dept", "==", m_dept).where("sem", "==", m_sem).where("section", "==", m_sec).stream()
                     updates = {}
@@ -590,14 +594,19 @@ def admin_dashboard():
                             updates[f"{k}.total"] = firestore.Increment(0)
                             updates[f"{k}.attended"] = firestore.Increment(0)
                     if updates: db.collection('Student_Summaries').document(m_usn).set(updates, merge=True)
-                    st.success("Added")
+                    st.toast("Student Added!", icon="✅")
 
 def student_dashboard():
     st.markdown("<h1 style='text-align: center;'>🎓 Student Portal</h1>", unsafe_allow_html=True)
     c2 = st.columns([1,2,1])[1]
-    usn = c2.text_input("Enter USN", key='std_portal_usn').strip().upper()
     
-    if c2.button("Check Attendance") and usn:
+    # IMPROVEMENT: Use Form for login
+    with c2.form("std_login"):
+        usn_input = st.text_input("Enter USN")
+        btn = st.form_submit_button("Check Attendance")
+    
+    if btn and usn_input:
+        usn = usn_input.strip().upper()
         try:
             doc = db.collection('Student_Summaries').document(usn).get()
             if not doc.exists: 
@@ -632,7 +641,7 @@ def student_dashboard():
                 st.altair_chart(c, use_container_width=True)
                 st.dataframe(df)
             else: st.info("No attendance data yet.")
-        except Exception as e: st.error(f"Error fetching data: {e}")
+        except Exception as e: st.error(f"Error: {e}")
 
 def main():
     with st.sidebar:
@@ -644,12 +653,18 @@ def main():
                 st.session_state['auth_user'] = None
                 st.rerun()
         else:
-            uid = st.text_input("Email/ID").strip()
-            pwd = st.text_input("Password", type="password").strip()
+            # IMPROVEMENT: Login Form for "Enter" key support
+            with st.form("login_form"):
+                uid = st.text_input("Email/ID")
+                pwd = st.text_input("Password", type="password")
+                submit_login = st.form_submit_button("Sign In")
             
-            if st.button("Sign In"):
+            if submit_login:
+                uid = uid.strip()
+                pwd = pwd.strip()
+                
                 if not uid: 
-                    st.warning("Please enter your ID/Email")
+                    st.warning("Enter ID")
                     return
                 
                 if uid == "admin" and pwd == "admin123":
@@ -657,20 +672,17 @@ def main():
                     st.rerun()
                 
                 try:
+                    # Smart Search logic remains
                     v1 = uid.lower()
                     v2 = sanitize_key(uid)
                     v3 = uid
-
-                    target_doc = None
-                    final_id = None
+                    target_doc = None; final_id = None
 
                     doc = db.collection('Users').document(v1).get()
                     if doc.exists: target_doc = doc; final_id = v1
-                    
                     if not target_doc:
                         doc = db.collection('Users').document(v2).get()
                         if doc.exists: target_doc = doc; final_id = v2
-
                     if not target_doc:
                         doc = db.collection('Users').document(v3).get()
                         if doc.exists: target_doc = doc; final_id = v3
@@ -679,7 +691,7 @@ def main():
                         user_data = target_doc.to_dict()
                         if user_data.get('password') == pwd:
                             st.session_state['auth_user'] = {**user_data, "id": final_id}
-                            st.success("Login Successful!")
+                            st.toast("Login Successful!", icon="🎉")
                             st.rerun()
                         else: st.error("❌ Incorrect Password")
                     else: st.error(f"❌ User ID not found.")
