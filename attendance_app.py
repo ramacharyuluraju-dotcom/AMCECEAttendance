@@ -318,14 +318,24 @@ def admin_force_sync():
 def render_report_tab(prefix=""):
     st.subheader("1. 🎓 Consolidated Detention/Attendance Report")
     
-    # IMPROVEMENT: Use Form to prevent reruns on dropdown select
     with st.form(key=f'{prefix}report_form'):
         c1, c2, c3 = st.columns(3)
-        s_dept = c1.selectbox("Department", ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE"], index=0, key=f'{prefix}rep_dept')
-        s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key=f'{prefix}rep_sem')
-        s_sec = c3.selectbox("Section", ["A", "B", "C", "D", "E", "F", "G"], index=0, key=f'{prefix}rep_sec')
         
-        # Submit Button acts as trigger
+        # 1. Departments: Added "Basic Science" and "MBA", plus made it editable if needed
+        # You can now type in this box if the dept isn't listed, or pick from the list.
+        s_dept = c1.selectbox(
+            "Department", 
+            ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE", "BS", "MBA", "MCA"], 
+            index=0, 
+            key=f'{prefix}rep_dept'
+        )
+        
+        s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key=f'{prefix}rep_sem')
+        
+        # 2. FIX: Changed from Dropdown to Text Input
+        # Now you can type "H", "I", "A1", or anything.
+        s_sec = c3.text_input("Section (Type letter)", value="A", key=f'{prefix}rep_sec').strip().upper()
+        
         submit_cons = st.form_submit_button("🚀 Generate Consolidated Report")
 
     if submit_cons:
@@ -337,12 +347,11 @@ def render_report_tab(prefix=""):
             st.dataframe(df)
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode('utf-8'), "Consolidated_Attendance.csv", key=f'{prefix}dl_cons')
         else:
-            st.warning("No data found for this class.")
+            st.warning(f"No data found for {s_dept} - Sem {s_sem} - Section {s_sec}")
 
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
     
-    # IMPROVEMENT: Use Form to prevent reruns on Date Select
     with st.form(key=f'{prefix}log_form'):
         c1, c2 = st.columns(2)
         l_start = c1.date_input("From Date", datetime.date.today().replace(day=1), key=f'{prefix}rep_start_date')
