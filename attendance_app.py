@@ -25,7 +25,6 @@ if 'admin_search_usn' not in st.session_state:
 # Initialize Firebase
 if not firebase_admin._apps:
     try:
-        # Check if secrets exist (Streamlit Cloud), otherwise look for local file
         if "firebase" in st.secrets:
             key_dict = dict(st.secrets["firebase"])
             cred = credentials.Certificate(key_dict)
@@ -281,6 +280,38 @@ def process_students_csv(df):
     batch.commit()
     return count
 
+def process_faculty_csv(df):
+    """Processes bulk faculty upload"""
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    
+    required = ['name', 'email', 'dept']
+    if not all(col in df.columns for col in required):
+        return 0, "❌ Error: CSV must have 'name', 'email', and 'dept' columns."
+    
+    batch = db.batch()
+    count = 0
+    
+    for _, row in df.iterrows():
+        email = str(row['email']).strip().lower()
+        if not email or "@" not in email: continue
+        
+        data = {
+            "name": str(row['name']).strip(),
+            "role": "Faculty",
+            "dept": str(row['dept']).strip().upper(),
+            "password": str(row.get('password', 'password123')).strip() 
+        }
+        
+        batch.set(db.collection('Users').document(email), data, merge=True)
+        count += 1
+        
+        if count % 400 == 0: 
+            batch.commit()
+            batch = db.batch()
+            
+    batch.commit()
+    return count, "Success"
+
 def admin_force_sync():
     students = db.collection('Students').stream()
     courses = list(db.collection('Courses').stream())
@@ -318,22 +349,17 @@ def admin_force_sync():
 def render_report_tab(prefix=""):
     st.subheader("1. 🎓 Consolidated Detention/Attendance Report")
     
+    # IMPROVEMENT: Use Form to prevent reruns on dropdown select
     with st.form(key=f'{prefix}report_form'):
         c1, c2, c3 = st.columns(3)
-        
-        # 1. Departments: Added "Basic Science" and "MBA", plus made it editable if needed
-        # You can now type in this box if the dept isn't listed, or pick from the list.
+        # Type-able Dept/Sec to handle new sections/depts dynamically
         s_dept = c1.selectbox(
             "Department", 
             ["ECE", "CSE", "ISE", "AIML", "MECH", "CIVIL", "EEE", "BS", "MBA", "MCA"], 
             index=0, 
             key=f'{prefix}rep_dept'
         )
-        
         s_sem = c2.selectbox("Semester", ["1", "2", "3", "4", "5", "6", "7", "8"], index=2, key=f'{prefix}rep_sem')
-        
-        # 2. FIX: Changed from Dropdown to Text Input
-        # Now you can type "H", "I", "A1", or anything.
         s_sec = c3.text_input("Section (Type letter)", value="A", key=f'{prefix}rep_sec').strip().upper()
         
         submit_cons = st.form_submit_button("🚀 Generate Consolidated Report")
@@ -347,7 +373,7 @@ def render_report_tab(prefix=""):
             st.dataframe(df)
             st.download_button("⬇️ Download CSV", df.to_csv(index=False).encode('utf-8'), "Consolidated_Attendance.csv", key=f'{prefix}dl_cons')
         else:
-            st.warning(f"No data found for {s_dept} - Sem {s_sem} - Section {s_sec}")
+            st.warning("No data found for this class.")
 
     st.divider()
     st.subheader("2. 📝 Class Log (Audit)")
@@ -370,7 +396,6 @@ def render_report_tab(prefix=""):
 def faculty_dashboard(user):
     st.title(f"👨‍🏫 {user['name']}")
     
-    # Define tabs first to avoid jumping
     tab_attendance, tab_history, tab_reports = st.tabs(["📝 Attendance", "📜 History", "📊 Reports"])
     
     my_courses = get_faculty_courses(user['id'])
@@ -453,9 +478,7 @@ def faculty_dashboard(user):
                         batch.commit()
     with tab_history:
         try:
-            # OPTIMIZATION: Limit to recent 50 logs to prevent lag
-            logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id'])\
-                .limit(50).stream() 
+            logs_stream = db.collection('Class_Sessions').where("faculty_id", "==", user['id']).limit(50).stream() 
             logs = sorted([l for l in logs_stream], key=lambda x: x.to_dict().get('date', ''), reverse=True)
             
             if logs:
@@ -485,17 +508,29 @@ def admin_dashboard():
     t1, t2, t3, t4, t5 = st.tabs(["📤 Uploads", "🔧 Tools", "📊 Reports", "👨‍🏫 Faculty", "🎓 Students"])
     
     with t1:
-        c1, c2 = st.columns(2)
+        # BULK UPLOAD SECTION (Faculty Added)
+        c1, c2, c3 = st.columns(3)
         with c1:
-            f1 = st.file_uploader("Courses CSV", type='csv', key='a')
+            st.markdown("### 📘 Courses")
+            f1 = st.file_uploader("Courses CSV", type='csv', key='csv_courses')
             if f1 and st.button("Process Courses"):
                 c, logs = process_courses_csv(pd.read_csv(f1))
                 st.toast(f"Processed {c} courses!", icon="✅")
         with c2:
-            f2 = st.file_uploader("Students CSV", type='csv', key='b')
+            st.markdown("### 🎓 Students")
+            f2 = st.file_uploader("Students CSV", type='csv', key='csv_students')
             if f2 and st.button("Process Students"):
                 c = process_students_csv(pd.read_csv(f2))
                 st.toast(f"Registered {c} students!", icon="✅")
+        with c3:
+            st.markdown("### 👨‍🏫 Faculty")
+            f3 = st.file_uploader("Faculty CSV", type='csv', key='csv_faculty')
+            if f3 and st.button("Process Faculty"):
+                c, msg = process_faculty_csv(pd.read_csv(f3))
+                if c > 0:
+                    st.toast(f"Onboarded {c} faculty members!", icon="✅")
+                else:
+                    st.error(msg)
 
     with t2:
         if st.button("🔄 Sync/Fix All"):
@@ -510,7 +545,6 @@ def admin_dashboard():
         tab_new, tab_manage = st.tabs(["Add New", "Manage & Reassign"])
         
         with tab_new:
-            # IMPROVEMENT: Use Form for cleaner input
             with st.form("add_fac_form"):
                 c1, c2 = st.columns(2)
                 n_name = c1.text_input("Name")
@@ -554,7 +588,6 @@ def admin_dashboard():
         st.subheader("Manage Students")
         ts, ta = st.tabs(["🔍 Search & Edit", "➕ Add Manual"])
         with ts:
-            # IMPROVEMENT: Use Form for Search to avoid partial typing reloads
             with st.form("search_form"):
                 col_s, col_b = st.columns([3, 1])
                 s_in_raw = col_s.text_input("Enter USN")
@@ -609,7 +642,6 @@ def student_dashboard():
     st.markdown("<h1 style='text-align: center;'>🎓 Student Portal</h1>", unsafe_allow_html=True)
     c2 = st.columns([1,2,1])[1]
     
-    # IMPROVEMENT: Use Form for login
     with c2.form("std_login"):
         usn_input = st.text_input("Enter USN")
         btn = st.form_submit_button("Check Attendance")
@@ -641,12 +673,19 @@ def student_dashboard():
             if rows:
                 df = pd.DataFrame(rows)
                 st.metric("Average", f"{df['Percentage'].mean():.1f}%")
-                c = alt.Chart(df).mark_bar(size=30).encode(
-                    x=alt.X('Subject', sort='-y'), 
+                
+                # FIXED BAR GRAPH
+                c = alt.Chart(df).mark_bar(
+                    size=30,  # Fixes "Green Wall" Effect
+                    cornerRadiusTopLeft=5,
+                    cornerRadiusTopRight=5
+                ).encode(
+                    x=alt.X('Subject', sort='-y', scale=alt.Scale(padding=0.5)), 
                     y=alt.Y('Percentage', scale=alt.Scale(domain=[0, 100])),
                     color=alt.condition(alt.datum.Percentage < 75, alt.value('#FF4B4B'), alt.value('#00CC96')),
                     tooltip=['Subject', 'Percentage']
                 ).properties(height=250)
+                
                 st.altair_chart(c, use_container_width=True)
                 st.dataframe(df)
             else: st.info("No attendance data yet.")
@@ -662,7 +701,6 @@ def main():
                 st.session_state['auth_user'] = None
                 st.rerun()
         else:
-            # IMPROVEMENT: Login Form for "Enter" key support
             with st.form("login_form"):
                 uid = st.text_input("Email/ID")
                 pwd = st.text_input("Password", type="password")
@@ -681,7 +719,6 @@ def main():
                     st.rerun()
                 
                 try:
-                    # Smart Search logic remains
                     v1 = uid.lower()
                     v2 = sanitize_key(uid)
                     v3 = uid
